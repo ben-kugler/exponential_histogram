@@ -4,7 +4,15 @@
       "WebFetch(domain:docs.rs)",
       "Bash(cargo test:*)",
       "Bash(cargo clippy:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(cargo doc:*)",
+      "Bash(rm:*)",
+      "Bash(mkdir:*)",
+      "Bash(cargo run:*)"
     ],
     "deny": [],
     "ask": []
