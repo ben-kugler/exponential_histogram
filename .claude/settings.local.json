@@ -12,7 +12,8 @@
       "Bash(cargo doc:*)",
       "Bash(rm:*)",
       "Bash(mkdir:*)",
-      "Bash(cargo run:*)"
+      "Bash(cargo run:*)",
+      "Bash(cargo bench:*)"
     ],
     "deny": [],
     "ask": []

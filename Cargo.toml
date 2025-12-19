@@ -3,5 +3,16 @@ name = "exponential-histogram"
 version = "0.2.1"
 edition = "2024"
 
+[lib]
+bench = false
+
+[[bench]]
+name = "bench"
+harness = false
+
 [dependencies]
-histogram = "0.11"
+
+[dev-dependencies]
+criterion                       = { version = "0.5" }
+histogram                       = { version = "0.11" }
+rand                            = { version = "0.8" }

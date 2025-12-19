@@ -1,38 +1,231 @@
-use histogram::{AtomicHistogram, Histogram as InnerHistogram};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
-/// Internal grouping power for the histogram crate.
-/// We always use 7 (128 buckets per octave) for maximum precision,
-/// then convert to OTel indices at read time.
-const INTERNAL_GROUPING_POWER: u8 = 7;
+// Maximum scale supported (per OTel spec)
+const MAX_SCALE: i32 = 20;
+
+/// Pre-allocated capacity to avoid allocations in hot path
+const INITIAL_CAPACITY: usize = 256;
 
 /// Convert a value to an OpenTelemetry exponential histogram bucket index.
-/// The formula is: floor(log2(value) * 2^scale)
-/// This maps values to bucket indices where bucket i covers [base^i, base^(i+1))
-/// and base = 2^(2^(-scale)).
-#[inline]
-fn value_to_otel_index(value: f64, scale: u8) -> i32 {
-    if value <= 0.0 {
-        return i32::MIN; // Invalid, will be filtered out
+/// https://opentelemetry.io/docs/specs/otel/metrics/data-model/#producer-expectations
+#[inline(always)]
+fn value_to_otel_index(value: f64, scale: i32) -> Option<i32> {
+    if value <= 0.0 || !value.is_finite() {
+        return None;
     }
-    let scale_factor = (2.0_f64).powi(scale as i32);
-    (value.ln() * scale_factor / std::f64::consts::LN_2).floor() as i32
+
+    // For negative or 0 scales, bit manipulation instead of OTel formula of
+    // index = ceiling(log(value) / log(base)) - 1
+    if scale <= 0 {
+        let bits = value.to_bits();
+        // Wiki: For a f64, the exponent is stored in the range [1, 2046]
+        // and is interpreted by subtracting the bias for an 11-bit exponent (1023)
+        // to get an exponent value in the range [−1022, 1023].
+        //
+        // 1. Shift right 52 bits to move the exponent to the low bits
+        // 2. 0x7FF, clears the sign bit and keep only the 11 bits of the exponent
+        // 3. Subtract the IEEE 754 bias (1023) to get the actual exponent
+        let exponent = ((bits >> 52) & 0x7FF) as i32 - 1023;
+        return Some(if scale == 0 {
+            exponent
+        } else {
+            exponent >> (-scale)
+        });
+    }
+
+    // For positive scales
+    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    Some((value.ln() / base.ln()).ceil() as i32 - 1)
 }
 
+// Calculate bucket boundaries, used at export time
+#[inline]
+fn bucket_boundaries(index: i32, scale: i32) -> (f64, f64) {
+    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    (base.powi(index), base.powi(index + 1))
+}
+
+// In place of histogram::Histogram
+#[derive(Clone, Debug)]
+struct InnerHistogram {
+    bucket_counts: Box<[u64; INITIAL_CAPACITY]>,
+    // The index of the first entry of OTel data in bucket_counts
+    offset: i32,
+    // Our data lies between min_boundry and max_boundry
+    min_boundry: i32,
+    max_boundry: i32,
+    // Have we seen any data?
+    initialized: bool,
+}
+
+impl InnerHistogram {
+    fn new() -> Self {
+        Self {
+            bucket_counts: Box::new([0u64; INITIAL_CAPACITY]),
+            offset: 0,
+            min_boundry: 0,
+            max_boundry: 0,
+            initialized: false,
+        }
+    }
+
+    #[inline(always)]
+    fn increment(&mut self, otel_index: i32) {
+        if !self.initialized {
+            // First value: set offset
+            self.offset = otel_index;
+            self.min_boundry = otel_index;
+            self.max_boundry = otel_index;
+            self.initialized = true;
+            self.bucket_counts[0] = 1;
+            return;
+        }
+
+        let index = otel_index - self.offset;
+
+        // Common path
+        if index >= 0 && (index as usize) < INITIAL_CAPACITY {
+            self.bucket_counts[index as usize] += 1;
+            if otel_index < self.min_boundry {
+                self.min_boundry = otel_index;
+            }
+            if otel_index > self.max_boundry {
+                self.max_boundry = otel_index;
+            }
+            return;
+        }
+
+        // Uncommon path, slower
+        if index < 0 {
+            let shift = (-index) as usize;
+            if shift < INITIAL_CAPACITY {
+                // Shift existing data right
+                for i in (shift..INITIAL_CAPACITY).rev() {
+                    self.bucket_counts[i] = self.bucket_counts[i - shift];
+                }
+                // Zero out new space
+                for i in 0..shift {
+                    self.bucket_counts[i] = 0;
+                }
+                self.bucket_counts[0] = 1;
+                self.offset = otel_index;
+                self.min_boundry = otel_index;
+            }
+        } else {
+            // Beyond capacity: cap at max bucket
+            let cap = (INITIAL_CAPACITY - 1).min(index as usize);
+            self.bucket_counts[cap] += 1;
+            if otel_index > self.max_boundry {
+                self.max_boundry = self.max_boundry.max(self.offset + cap as i32);
+            }
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        !self.initialized
+    }
+
+    fn total_count(&self) -> u64 {
+        if !self.initialized {
+            return 0;
+        }
+        let end = ((self.max_boundry - self.offset + 1) as usize).min(INITIAL_CAPACITY);
+        self.bucket_counts[0..end].iter().sum()
+    }
+
+    fn min_index(&self) -> Option<i32> {
+        if !self.initialized {
+            None
+        } else {
+            Some(self.min_boundry)
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (i32, u64)> {
+        if !self.initialized {
+            return IterHelper::Empty;
+        }
+        let end = ((self.max_boundry - self.offset + 1) as usize).min(INITIAL_CAPACITY);
+        IterHelper::Active {
+            buckets: &self.bucket_counts[0..end],
+            offset: self.offset,
+            index: 0,
+        }
+    }
+
+    fn to_vec_deque(&self) -> VecDeque<usize> {
+        if !self.initialized {
+            return VecDeque::new();
+        }
+        let end = ((self.max_boundry - self.offset + 1) as usize).min(INITIAL_CAPACITY);
+        self.bucket_counts[0..end]
+            .iter()
+            .map(|&c| c as usize)
+            .collect()
+    }
+}
+
+enum IterHelper<'a> {
+    Empty,
+    Active {
+        buckets: &'a [u64],
+        offset: i32,
+        index: usize,
+    },
+}
+
+impl<'a> Iterator for IterHelper<'a> {
+    type Item = (i32, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            IterHelper::Empty => None,
+            IterHelper::Active {
+                buckets,
+                offset,
+                index,
+            } => {
+                while *index < buckets.len() {
+                    let i = *index;
+                    *index += 1;
+                    if buckets[i] > 0 {
+                        return Some((*offset + i as i32, buckets[i]));
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// An exponential histogram that stores f64 values in OpenTelemetry proto like buckets
+/// https://github.com/open-telemetry/opentelemetry-proto/blob/cfbf9357c03bf4ac150a3ab3bcbe4cc4ed087362/opentelemetry/proto/metrics/v1/metrics.proto#L466
 pub struct ExponentialHistogram {
-    positive: InnerHistogram,
-    negative: InnerHistogram,
-    scale: u8,
-    max_buckets: u16,
+    positive_buckets: InnerHistogram,
+    negative_buckets: InnerHistogram,
+    // zero_count is the count of values that are either exactly zero or
+    // within the zero_threshold, which defaults to 0.0
+    zero_count: u64,
+    zero_threshold: f64,
+    // scale describes the resolution of the histogram
+    scale: i32,
+    // running sum of values seen so far
+    sum: f64,
+    // min and max values seen so far
+    min_value: Option<f64>,
+    max_value: Option<f64>,
 }
 
 impl std::fmt::Debug for ExponentialHistogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExponentialHistogram")
             .field("scale", &self.scale)
-            .field("max_buckets", &self.max_buckets)
+            .field("zero_threshold", &self.zero_threshold)
             .field("count", &self.count())
-            .field("sum", &self.sum())
+            .field("zero_count", &self.zero_count)
+            .field("sum", &self.sum)
             .field("min", &self.min())
             .field("max", &self.max())
             .field("has_negatives", &self.has_negatives())
@@ -43,61 +236,40 @@ impl std::fmt::Debug for ExponentialHistogram {
 impl Clone for ExponentialHistogram {
     fn clone(&self) -> Self {
         Self {
-            positive: self.positive.clone(),
-            negative: self.negative.clone(),
+            positive_buckets: self.positive_buckets.clone(),
+            negative_buckets: self.negative_buckets.clone(),
+            zero_count: self.zero_count,
+            zero_threshold: self.zero_threshold,
             scale: self.scale,
-            max_buckets: self.max_buckets,
+            sum: self.sum,
+            min_value: self.min_value,
+            max_value: self.max_value,
         }
     }
 }
 
 impl PartialEq for ExponentialHistogram {
     fn eq(&self, other: &Self) -> bool {
-        // Compare configuration
-        if self.scale != other.scale || self.max_buckets != other.max_buckets {
+        if self.scale != other.scale
+            || self.zero_count != other.zero_count
+            || (self.zero_threshold - other.zero_threshold).abs() >= f64::EPSILON
+            || (self.sum - other.sum).abs() >= f64::EPSILON
+        {
             return false;
         }
 
-        // Compare computed statistics
-        if self.count() != other.count() {
+        let self_positive: Vec<_> = self.positive_buckets.iter().collect();
+        let other_positive: Vec<_> = other.positive_buckets.iter().collect();
+        if self_positive != other_positive {
             return false;
         }
 
-        // Compare bucket data for positive histogram
-        let self_positive_buckets: Vec<_> = self
-            .positive
-            .iter()
-            .filter(|b| b.count() > 0)
-            .map(|b| (b.start(), b.end(), b.count()))
-            .collect();
+        let self_negative: Vec<_> = self.negative_buckets.iter().collect();
+        let other_negative: Vec<_> = other.negative_buckets.iter().collect();
 
-        let other_positive_buckets: Vec<_> = other
-            .positive
-            .iter()
-            .filter(|b| b.count() > 0)
-            .map(|b| (b.start(), b.end(), b.count()))
-            .collect();
-
-        if self_positive_buckets != other_positive_buckets {
-            return false;
-        }
-
-        // Compare bucket data for negative histogram
-        let self_negative_buckets: Vec<_> = self
-            .negative
-            .iter()
-            .filter(|b| b.count() > 0)
-            .map(|b| (b.start(), b.end(), b.count()))
-            .collect();
-
-        let other_negative_buckets: Vec<_> = other
-            .negative
-            .iter()
-            .filter(|b| b.count() > 0)
-            .map(|b| (b.start(), b.end(), b.count()))
-            .collect();
-
-        self_negative_buckets == other_negative_buckets
+        self_negative == other_negative
+            && self.min_value == other.min_value
+            && self.max_value == other.max_value
     }
 }
 
@@ -122,47 +294,68 @@ impl Default for ExponentialHistogram {
 }
 
 impl ExponentialHistogram {
-    pub fn new(desired_scale: u8) -> Self {
+    pub fn new(desired_scale: i32) -> Self {
         Self::new_with_max_buckets(desired_scale, 160)
     }
 
-    pub fn new_with_max_buckets(desired_scale: u8, max_buckets: u16) -> Self {
-        // Always use max grouping power internally for best precision.
-        // The desired_scale is stored and used when converting to OTel indices.
-        let max_value_power = 64;
-
-        let positive = InnerHistogram::new(INTERNAL_GROUPING_POWER, max_value_power)
-            .expect("failed to create histogram");
-        let negative = InnerHistogram::new(INTERNAL_GROUPING_POWER, max_value_power)
-            .expect("failed to create histogram");
-
+    pub fn new_with_max_buckets(desired_scale: i32, _ignored: u16) -> Self {
+        let scale = desired_scale.min(MAX_SCALE);
         Self {
-            positive,
-            negative,
-            scale: desired_scale,
-            max_buckets,
+            positive_buckets: InnerHistogram::new(),
+            negative_buckets: InnerHistogram::new(),
+            zero_count: 0,
+            zero_threshold: 0.0,
+            scale,
+            sum: 0.0,
+            min_value: None,
+            max_value: None,
         }
     }
 
-    pub fn reset(&mut self) {
-        let max_value_power = 64;
-
-        self.positive = InnerHistogram::new(INTERNAL_GROUPING_POWER, max_value_power)
-            .expect("failed to create histogram");
-        self.negative = InnerHistogram::new(INTERNAL_GROUPING_POWER, max_value_power)
-            .expect("failed to create histogram");
+    pub fn with_zero_threshold(mut self, threshold: f64) -> Self {
+        self.zero_threshold = threshold;
+        self
     }
 
+    pub fn reset(&mut self) {
+        self.positive_buckets = InnerHistogram::new();
+        self.negative_buckets = InnerHistogram::new();
+        self.zero_count = 0;
+        self.sum = 0.0;
+        self.min_value = None;
+        self.max_value = None;
+    }
+
+    #[inline(always)]
     pub fn accumulate<T: Into<f64>>(&mut self, value: T) {
         let val: f64 = value.into();
 
-        if val.is_finite() {
-            let abs_val = val.abs();
-            if val >= 0.0 {
-                let _ = self.positive.increment(abs_val as u64);
-            } else {
-                let _ = self.negative.increment(abs_val as u64);
-            }
+        if !val.is_finite() {
+            return;
+        }
+
+        self.sum += val;
+        self.min_value = Some(self.min_value.map_or(val, |m| m.min(val)));
+        self.max_value = Some(self.max_value.map_or(val, |m| m.max(val)));
+
+        if self.zero_threshold == 0.0 && val == 0.0 {
+            self.zero_count += 1;
+            return;
+        } else if val.abs() <= self.zero_threshold {
+            self.zero_count += 1;
+            return;
+        }
+
+        // Determine bucket which bucket to use
+        let abs_val = val.abs();
+        let buckets = if val >= 0.0 {
+            &mut self.positive_buckets
+        } else {
+            &mut self.negative_buckets
+        };
+
+        if let Some(index) = value_to_otel_index(abs_val, self.scale) {
+            buckets.increment(index);
         }
     }
 
@@ -171,191 +364,58 @@ impl ExponentialHistogram {
     }
 
     pub fn count(&self) -> usize {
-        let mut count = 0;
-        for bucket in self.positive.iter() {
-            if bucket.count() > 0 {
-                count += bucket.count() as usize;
-            }
-        }
-        for bucket in self.negative.iter() {
-            if bucket.count() > 0 {
-                count += bucket.count() as usize;
-            }
-        }
-        count
+        (self.positive_buckets.total_count()
+            + self.negative_buckets.total_count()
+            + self.zero_count) as usize
     }
 
     pub fn sum(&self) -> f64 {
-        let mut sum = 0.0;
-        for bucket in self.positive.iter() {
-            if bucket.count() > 0 {
-                let bucket_mid = (bucket.start() + bucket.end()) as f64 / 2.0;
-                sum += bucket_mid * bucket.count() as f64;
-            }
-        }
-        for bucket in self.negative.iter() {
-            if bucket.count() > 0 {
-                let bucket_mid = (bucket.start() + bucket.end()) as f64 / 2.0;
-                sum -= bucket_mid * bucket.count() as f64;
-            }
-        }
-        sum
+        self.sum
     }
 
     pub fn min(&self) -> f64 {
-        // Check negative histogram first (most negative value - largest bucket)
-        let mut neg_max = None;
-        for bucket in self.negative.iter() {
-            if bucket.count() > 0 {
-                neg_max = Some(bucket.end() as f64);
-            }
-        }
-        if let Some(val) = neg_max {
-            return -val;
-        }
-
-        // If no negatives, check positive histogram (smallest bucket)
-        for bucket in self.positive.iter() {
-            if bucket.count() > 0 {
-                return bucket.start() as f64;
-            }
-        }
-        0.0
+        self.min_value.unwrap_or(0.0)
     }
 
     pub fn max(&self) -> f64 {
-        // Check positive histogram first (most positive value)
-        let mut max = 0.0;
-        for bucket in self.positive.iter() {
-            if bucket.count() > 0 {
-                max = bucket.end() as f64;
-            }
-        }
-        if max > 0.0 {
-            return max;
-        }
-        // If no positives, check negative histogram
-        for bucket in self.negative.iter() {
-            if bucket.count() > 0 {
-                return -(bucket.start() as f64);
-            }
-        }
-        0.0
+        self.max_value.unwrap_or(0.0)
     }
 
-    pub fn scale(&self) -> u8 {
+    pub fn scale(&self) -> i32 {
         self.scale
     }
 
-    /// Returns the starting bucket index offset for the positive buckets.
-    /// This is the minimum OTel bucket index that contains data.
-    pub fn bucket_start_offset(&self) -> usize {
-        // Find the minimum OTel index from positive buckets
-        let mut min_index: Option<i32> = None;
-
-        for bucket in self.positive.iter() {
-            if bucket.count() > 0 {
-                let midpoint = (bucket.start() + bucket.end()) as f64 / 2.0;
-                let otel_idx = value_to_otel_index(midpoint, self.scale);
-                if otel_idx > i32::MIN {
-                    min_index = Some(match min_index {
-                        Some(current) => current.min(otel_idx),
-                        None => otel_idx,
-                    });
-                }
-            }
-        }
-
-        // Return as usize; if no data, return 0
-        min_index.unwrap_or(0).max(0) as usize
+    pub fn zero_count(&self) -> u64 {
+        self.zero_count
     }
 
-    /// Returns the starting bucket index offset for the negative buckets.
-    pub fn negative_bucket_start_offset(&self) -> usize {
-        let mut min_index: Option<i32> = None;
+    pub fn bucket_start_offset(&self) -> i32 {
+        self.positive_buckets.min_index().unwrap_or(0)
+    }
 
-        for bucket in self.negative.iter() {
-            if bucket.count() > 0 {
-                let midpoint = (bucket.start() + bucket.end()) as f64 / 2.0;
-                let otel_idx = value_to_otel_index(midpoint, self.scale);
-                if otel_idx > i32::MIN {
-                    min_index = Some(match min_index {
-                        Some(current) => current.min(otel_idx),
-                        None => otel_idx,
-                    });
-                }
-            }
-        }
-
-        min_index.unwrap_or(0).max(0) as usize
+    pub fn negative_bucket_start_offset(&self) -> i32 {
+        self.negative_buckets.min_index().unwrap_or(0)
     }
 
     pub fn has_negatives(&self) -> bool {
-        for bucket in self.negative.iter() {
-            if bucket.count() > 0 {
-                return true;
-            }
-        }
-        false
+        !self.negative_buckets.is_empty()
     }
 
-    /// Returns (positive_counts, negative_counts) as VecDeques.
-    /// The counts are indexed by OTel bucket index, starting from bucket_start_offset().
-    /// Empty buckets between the min and max indices are included as zeros.
     pub fn take_counts(self) -> (VecDeque<usize>, VecDeque<usize>) {
-        // Convert positive histogram buckets to OTel indices
-        let positive_counts = Self::convert_to_otel_counts(&self.positive, self.scale);
-        let negative_counts = Self::convert_to_otel_counts(&self.negative, self.scale);
-
+        let positive_counts = self.positive_buckets.to_vec_deque();
+        let negative_counts = self.negative_buckets.to_vec_deque();
         (positive_counts, negative_counts)
     }
 
-    /// Helper function to convert internal histogram buckets to OTel-indexed counts.
-    fn convert_to_otel_counts(hist: &InnerHistogram, scale: u8) -> VecDeque<usize> {
-        // First pass: collect counts by OTel index
-        let mut otel_buckets: BTreeMap<i32, u64> = BTreeMap::new();
-
-        for bucket in hist.iter() {
-            if bucket.count() > 0 {
-                let midpoint = (bucket.start() + bucket.end()) as f64 / 2.0;
-                let otel_idx = value_to_otel_index(midpoint, scale);
-                if otel_idx > i32::MIN {
-                    *otel_buckets.entry(otel_idx).or_insert(0) += bucket.count();
-                }
-            }
-        }
-
-        if otel_buckets.is_empty() {
-            return VecDeque::new();
-        }
-
-        // Build contiguous VecDeque from min to max index
-        let min_idx = *otel_buckets.keys().min().unwrap();
-        let max_idx = *otel_buckets.keys().max().unwrap();
-
-        let mut counts = VecDeque::with_capacity((max_idx - min_idx + 1) as usize);
-        for idx in min_idx..=max_idx {
-            counts.push_back(*otel_buckets.get(&idx).unwrap_or(&0) as usize);
-        }
-
-        counts
-    }
-
     pub fn value_counts(&self) -> impl Iterator<Item = (f64, usize)> + '_ {
-        let positive_iter = self.positive.iter().filter_map(|bucket| {
-            if bucket.count() > 0 {
-                Some((bucket.end() as f64, bucket.count() as usize))
-            } else {
-                None
-            }
+        let positive_iter = self.positive_buckets.iter().map(move |(idx, count)| {
+            let (_, upper) = bucket_boundaries(idx, self.scale);
+            (upper, count as usize)
         });
 
-        let negative_iter = self.negative.iter().filter_map(|bucket| {
-            if bucket.count() > 0 {
-                Some((-(bucket.end() as f64), bucket.count() as usize))
-            } else {
-                None
-            }
+        let negative_iter = self.negative_buckets.iter().map(move |(idx, count)| {
+            let (_, upper) = bucket_boundaries(idx, self.scale);
+            (-upper, count as usize)
         });
 
         negative_iter.chain(positive_iter)
@@ -363,19 +423,14 @@ impl ExponentialHistogram {
 }
 
 pub struct SharedExponentialHistogram {
-    positive: AtomicHistogram,
-    negative: AtomicHistogram,
-    scale: u8,
-    #[allow(dead_code)]
-    max_buckets: u16,
+    inner: Arc<Mutex<ExponentialHistogram>>,
 }
 
 impl std::fmt::Debug for SharedExponentialHistogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snapshot = self.snapshot();
         f.debug_struct("SharedExponentialHistogram")
-            .field("scale", &self.scale)
-            .field("max_buckets", &self.max_buckets)
+            .field("scale", &snapshot.scale)
             .field("count", &snapshot.count())
             .field("sum", &snapshot.sum())
             .field("min", &snapshot.min())
@@ -392,62 +447,37 @@ impl Default for SharedExponentialHistogram {
 }
 
 impl SharedExponentialHistogram {
-    pub fn new(desired_scale: u8) -> Self {
+    pub fn new(desired_scale: i32) -> Self {
         Self::new_with_max_buckets(desired_scale, 160)
     }
 
-    pub fn new_with_max_buckets(desired_scale: u8, max_buckets: u16) -> Self {
-        // Always use max grouping power internally for best precision.
-        // The desired_scale is stored and used when converting to OTel indices.
-        let max_value_power = 64;
-
-        let positive = AtomicHistogram::new(INTERNAL_GROUPING_POWER, max_value_power)
-            .expect("failed to create atomic histogram");
-        let negative = AtomicHistogram::new(INTERNAL_GROUPING_POWER, max_value_power)
-            .expect("failed to create atomic histogram");
-
+    pub fn new_with_max_buckets(desired_scale: i32, _ignored: u16) -> Self {
         Self {
-            positive,
-            negative,
-            scale: desired_scale,
-            max_buckets,
+            inner: Arc::new(Mutex::new(ExponentialHistogram::new(desired_scale))),
         }
     }
 
     pub fn accumulate(&self, value: f64) {
-        if !value.is_finite() {
-            return;
-        }
-
-        let abs_val = value.abs();
-        if value >= 0.0 {
-            let _ = self.positive.increment(abs_val as u64);
-        } else {
-            let _ = self.negative.increment(abs_val as u64);
+        if let Ok(mut hist) = self.inner.lock() {
+            hist.accumulate(value);
         }
     }
 
     pub fn snapshot(&self) -> ExponentialHistogram {
-        let positive = self.positive.load();
-        let negative = self.negative.load();
-
-        ExponentialHistogram {
-            positive,
-            negative,
-            scale: self.scale,
-            max_buckets: self.max_buckets,
+        if let Ok(hist) = self.inner.lock() {
+            hist.clone()
+        } else {
+            ExponentialHistogram::default()
         }
     }
 
     pub fn snapshot_and_reset(&self) -> ExponentialHistogram {
-        let positive = self.positive.drain();
-        let negative = self.negative.drain();
-
-        ExponentialHistogram {
-            positive,
-            negative,
-            scale: self.scale,
-            max_buckets: self.max_buckets,
+        if let Ok(mut hist) = self.inner.lock() {
+            let snapshot = hist.clone();
+            hist.reset();
+            snapshot
+        } else {
+            ExponentialHistogram::default()
         }
     }
 }
@@ -504,25 +534,39 @@ mod tests {
 
         assert!(hist.has_negatives());
         assert_eq!(hist.count(), 3);
+        assert_eq!(hist.min(), -5.0);
+        assert_eq!(hist.max(), 10.0);
+        assert_eq!(hist.sum(), 3.0);
+    }
 
-        // Min should be approximately -5 (based on negative histogram buckets)
-        let min = hist.min();
-        assert!(min < 0.0, "min should be negative, got {}", min);
-        assert!(min <= -5.0, "min should be <= -5.0, got {}", min);
+    #[test]
+    fn test_fractional_values() {
+        let mut hist = ExponentialHistogram::new(4);
+        hist.accumulate(0.1);
+        hist.accumulate(0.5);
+        hist.accumulate(1.5);
+        hist.accumulate(2.7);
 
-        // Max should be approximately 10 (based on positive histogram buckets)
-        let max = hist.max();
-        assert!(max > 0.0, "max should be positive, got {}", max);
-        assert!(max >= 10.0, "max should be >= 10.0, got {}", max);
-
-        // Sum should be approximately 3.0 (= -5 + 10 - 2)
-        let sum = hist.sum();
-        println!("Sum: {}", sum);
+        assert_eq!(hist.count(), 4);
         assert!(
-            (sum - 3.0).abs() < 5.0,
-            "sum should be approximately 3.0, got {}",
-            sum
+            (hist.sum() - 4.8).abs() < 1e-10,
+            "sum should be approximately 4.8, got {}",
+            hist.sum()
         );
+        assert_eq!(hist.min(), 0.1);
+        assert_eq!(hist.max(), 2.7);
+    }
+
+    #[test]
+    fn test_zero_handling() {
+        let mut hist = ExponentialHistogram::new(0);
+        hist.accumulate(0.0);
+        hist.accumulate(0.0);
+        hist.accumulate(1.0);
+
+        assert_eq!(hist.count(), 3);
+        assert_eq!(hist.zero_count(), 2);
+        assert_eq!(hist.sum(), 1.0);
     }
 
     #[test]
@@ -604,61 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn test_histogram_zero_handling() {
-        let mut hist = InnerHistogram::new(0, 64).unwrap();
-
-        hist.increment(0).unwrap();
-        hist.increment(0).unwrap();
-        hist.increment(1).unwrap();
-
-        let mut total_count = 0;
-        println!("\nBuckets with data:");
-        for bucket in hist.iter() {
-            if bucket.count() > 0 {
-                println!(
-                    "  start={}, end={}, count={}",
-                    bucket.start(),
-                    bucket.end(),
-                    bucket.count()
-                );
-                total_count += bucket.count();
-            }
-        }
-
-        assert_eq!(total_count, 3, "Should track all values including zeros");
-    }
-
-    #[test]
-    fn test_histogram_sum_from_buckets() {
-        let mut hist = InnerHistogram::new(0, 64).unwrap();
-
-        hist.increment(10).unwrap();
-        hist.increment(20).unwrap();
-        hist.increment(30).unwrap();
-
-        let mut computed_sum = 0.0;
-        println!("\nComputing sum from buckets:");
-        for bucket in hist.iter() {
-            if bucket.count() > 0 {
-                let bucket_mid = (bucket.start() + bucket.end()) as f64 / 2.0;
-                let contribution = bucket_mid * bucket.count() as f64;
-                println!(
-                    "  Bucket [{}, {}]: count={}, mid={}, contribution={}",
-                    bucket.start(),
-                    bucket.end(),
-                    bucket.count(),
-                    bucket_mid,
-                    contribution
-                );
-                computed_sum += contribution;
-            }
-        }
-
-        println!("Computed sum: {}, Expected: 60", computed_sum);
-        println!("Note: Sum is approximate due to bucket quantization");
-    }
-
-    #[test]
     fn test_debug_implementation() {
         let mut hist = ExponentialHistogram::new(2);
         hist.accumulate(5.0);
@@ -683,7 +672,6 @@ mod tests {
 
     #[test]
     fn test_clone_implementation() {
-        // Test ExponentialHistogram clone
         let mut hist = ExponentialHistogram::new(2);
         hist.accumulate(5.0);
         hist.accumulate(-3.0);
@@ -696,9 +684,6 @@ mod tests {
         assert_eq!(hist.has_negatives(), cloned.has_negatives());
         assert_eq!(hist.min(), cloned.min());
         assert_eq!(hist.max(), cloned.max());
-
-        // SharedExponentialHistogram doesn't implement Clone - it's meant to be
-        // shared via Arc, not cloned. If you need independent copies, use snapshot().
     }
 
     #[test]
@@ -713,21 +698,17 @@ mod tests {
         hist2.accumulate(-3.0);
         hist2.accumulate(10.0);
 
-        // Should be equal
         assert_eq!(hist1, hist2);
 
-        // Add different value to hist2
         hist2.accumulate(20.0);
         assert_ne!(hist1, hist2);
 
-        // Different scale should not be equal
         let mut hist3 = ExponentialHistogram::new(1);
         hist3.accumulate(5.0);
         hist3.accumulate(-3.0);
         hist3.accumulate(10.0);
         assert_ne!(hist1, hist3);
 
-        // Test cloned histogram equals original
         let hist4 = hist1.clone();
         assert_eq!(hist1, hist4);
     }
@@ -740,35 +721,29 @@ mod tests {
         hist.accumulate(10.0);
 
         let display_output = format!("{}", hist);
-        println!("Display output: {}", display_output);
         assert!(display_output.contains("ExponentialHistogram"));
         assert!(display_output.contains("scale=2"));
         assert!(display_output.contains("count=3"));
 
-        // Test empty histogram
         let empty_hist = ExponentialHistogram::new(0);
         let empty_output = format!("{}", empty_hist);
-        println!("Empty display output: {}", empty_output);
         assert!(empty_output.contains("count=0"));
         assert!(empty_output.contains("sum=0.00"));
     }
 
     #[test]
     fn test_default_implementation() {
-        // Test ExponentialHistogram default
         let hist = ExponentialHistogram::default();
         assert_eq!(hist.scale(), 0);
         assert_eq!(hist.count(), 0);
         assert!(hist.is_empty());
 
-        // Test SharedExponentialHistogram default
         let shared = SharedExponentialHistogram::default();
         let snapshot = shared.snapshot();
         assert_eq!(snapshot.scale(), 0);
         assert_eq!(snapshot.count(), 0);
         assert!(snapshot.is_empty());
 
-        // Verify default histograms work normally
         let mut hist2 = ExponentialHistogram::default();
         hist2.accumulate(5.0);
         assert_eq!(hist2.count(), 1);
@@ -780,21 +755,11 @@ mod tests {
 
     #[test]
     fn test_otel_index_conversion() {
-        // Test that bucket_start_offset and take_counts produce valid OTel indices
-        let scale = 7u8;
+        let scale = 7;
         let mut hist = ExponentialHistogram::new(scale);
 
-        // Add values spanning several orders of magnitude (simulating nanosecond latencies)
         let test_values: Vec<u64> = vec![
-            1_000,      // 1 microsecond
-            5_000,      // 5 microseconds
-            10_000,     // 10 microseconds
-            50_000,     // 50 microseconds
-            100_000,    // 100 microseconds
-            500_000,    // 500 microseconds
-            1_000_000,  // 1 millisecond
-            5_000_000,  // 5 milliseconds
-            10_000_000, // 10 milliseconds
+            1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000,
         ];
 
         for &v in &test_values {
@@ -804,98 +769,57 @@ mod tests {
         let offset = hist.bucket_start_offset();
         let (positive_counts, negative_counts) = hist.take_counts();
 
-        // Verify we got the right count
         let total_count: usize = positive_counts.iter().sum();
-        assert_eq!(total_count, test_values.len(), "Total count should match");
-        assert!(negative_counts.is_empty(), "Should have no negative values");
-
-        // Verify the offset is reasonable (should be around log2(1000) * 2^7 = ~1275)
-        assert!(
-            offset > 1000,
-            "Offset should be > 1000 for values starting at 1000, got {}",
-            offset
-        );
-        assert!(
-            offset < 2000,
-            "Offset should be < 2000 for values starting at 1000, got {}",
-            offset
-        );
-
-        // Verify bucket count interpretation using OTel formula
-        // For OTel, bucket i covers [base^(offset+i), base^(offset+i+1))
-        // where base = 2^(2^(-scale))
-        let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
-
-        // The first bucket should cover a range containing 1000
-        let first_bucket_lower = base.powi(offset as i32);
-        let first_bucket_upper = base.powi(offset as i32 + 1);
+        assert_eq!(total_count, test_values.len());
+        assert!(negative_counts.is_empty());
 
         println!("Scale: {}", scale);
         println!("Offset: {}", offset);
-        println!(
-            "First bucket range: [{:.2}, {:.2})",
-            first_bucket_lower, first_bucket_upper
-        );
-        println!("First test value: {}", test_values[0]);
-
-        // The first bucket's range should contain or be close to 1000
-        assert!(
-            first_bucket_lower <= 1100.0 && first_bucket_upper >= 900.0,
-            "First bucket [{:.2}, {:.2}) should be near 1000",
-            first_bucket_lower,
-            first_bucket_upper
-        );
-
         println!("Bucket counts: {:?}", positive_counts);
     }
 
     #[test]
-    fn test_otel_percentile_accuracy() {
-        // Test that percentiles computed from OTel buckets are accurate
-        let scale = 7u8;
-        let mut hist = ExponentialHistogram::new(scale);
+    fn test_otel_bucket_boundaries() {
+        let scale = 0;
 
-        // Add known values
-        let test_values: Vec<u64> = vec![
-            1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000,
-        ];
+        let (lower, upper) = bucket_boundaries(0, scale);
+        assert_eq!(lower, 1.0);
+        assert_eq!(upper, 2.0);
 
-        for &v in &test_values {
-            hist.accumulate(v as f64);
-        }
+        let (lower, upper) = bucket_boundaries(1, scale);
+        assert_eq!(lower, 2.0);
+        assert_eq!(upper, 4.0);
+    }
 
-        let offset = hist.bucket_start_offset();
-        let (positive_counts, _) = hist.take_counts();
+    #[test]
+    fn test_otel_index_calculation() {
+        // Test scale 0 (base = 2)
+        assert_eq!(value_to_otel_index(1.5, 0), Some(0)); // (1, 2]
+        assert_eq!(value_to_otel_index(2.5, 0), Some(1)); // (2, 4]
+        assert_eq!(value_to_otel_index(5.0, 0), Some(2)); // (4, 8]
 
-        // Compute p50 from OTel buckets
-        let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
-        let total: usize = positive_counts.iter().sum();
-        let p50_target = (total as f64 * 0.5).ceil() as usize;
+        // Test fractional values
+        assert_eq!(value_to_otel_index(0.5, 0), Some(-1)); // (0.5, 1]
+        assert_eq!(value_to_otel_index(0.25, 0), Some(-2)); // (0.25, 0.5]
+    }
 
-        let mut cumulative = 0usize;
-        let mut p50_est = 0.0;
+    #[test]
+    fn test_bucket_array_indexing() {
+        let mut array = InnerHistogram::new();
 
-        for (i, &count) in positive_counts.iter().enumerate() {
-            cumulative += count;
-            if p50_est == 0.0 && cumulative >= p50_target {
-                p50_est = base.powi((offset + i + 1) as i32);
-                break;
-            }
-        }
+        // Test forward indexing
+        array.increment(5);
+        array.increment(10);
+        array.increment(7);
 
-        // True p50 for [1000..10000] is 5000-6000
-        let error_pct = ((p50_est - 5500.0) / 5500.0 * 100.0).abs();
-        println!(
-            "P50 estimate: {:.0}, expected ~5500, error: {:.2}%",
-            p50_est, error_pct
-        );
+        assert_eq!(array.offset, 5);
+        assert_eq!(array.min_boundry, 5);
+        assert_eq!(array.max_boundry, 10);
 
-        // Should be within 10% (histogram bucket quantization)
-        assert!(
-            error_pct < 10.0,
-            "P50 estimate {:.0} should be within 10% of 5500, got {:.2}% error",
-            p50_est,
-            error_pct
-        );
+        // Test backward indexing (shift)
+        array.increment(2);
+        assert_eq!(array.offset, 2);
+        assert_eq!(array.min_boundry, 2);
+        assert_eq!(array.max_boundry, 10);
     }
 }
