@@ -64,12 +64,16 @@ impl PartialEq for ExponentialHistogram {
         }
 
         // Compare bucket data for positive histogram
-        let self_positive_buckets: Vec<_> = self.positive.iter()
+        let self_positive_buckets: Vec<_> = self
+            .positive
+            .iter()
             .filter(|b| b.count() > 0)
             .map(|b| (b.start(), b.end(), b.count()))
             .collect();
 
-        let other_positive_buckets: Vec<_> = other.positive.iter()
+        let other_positive_buckets: Vec<_> = other
+            .positive
+            .iter()
             .filter(|b| b.count() > 0)
             .map(|b| (b.start(), b.end(), b.count()))
             .collect();
@@ -79,12 +83,16 @@ impl PartialEq for ExponentialHistogram {
         }
 
         // Compare bucket data for negative histogram
-        let self_negative_buckets: Vec<_> = self.negative.iter()
+        let self_negative_buckets: Vec<_> = self
+            .negative
+            .iter()
             .filter(|b| b.count() > 0)
             .map(|b| (b.start(), b.end(), b.count()))
             .collect();
 
-        let other_negative_buckets: Vec<_> = other.negative.iter()
+        let other_negative_buckets: Vec<_> = other
+            .negative
+            .iter()
             .filter(|b| b.count() > 0)
             .map(|b| (b.start(), b.end(), b.count()))
             .collect();
@@ -510,7 +518,11 @@ mod tests {
         // Sum should be approximately 3.0 (= -5 + 10 - 2)
         let sum = hist.sum();
         println!("Sum: {}", sum);
-        assert!((sum - 3.0).abs() < 5.0, "sum should be approximately 3.0, got {}", sum);
+        assert!(
+            (sum - 3.0).abs() < 5.0,
+            "sum should be approximately 3.0, got {}",
+            sum
+        );
     }
 
     #[test]
@@ -603,8 +615,12 @@ mod tests {
         println!("\nBuckets with data:");
         for bucket in hist.iter() {
             if bucket.count() > 0 {
-                println!("  start={}, end={}, count={}",
-                         bucket.start(), bucket.end(), bucket.count());
+                println!(
+                    "  start={}, end={}, count={}",
+                    bucket.start(),
+                    bucket.end(),
+                    bucket.count()
+                );
                 total_count += bucket.count();
             }
         }
@@ -626,8 +642,14 @@ mod tests {
             if bucket.count() > 0 {
                 let bucket_mid = (bucket.start() + bucket.end()) as f64 / 2.0;
                 let contribution = bucket_mid * bucket.count() as f64;
-                println!("  Bucket [{}, {}]: count={}, mid={}, contribution={}",
-                         bucket.start(), bucket.end(), bucket.count(), bucket_mid, contribution);
+                println!(
+                    "  Bucket [{}, {}]: count={}, mid={}, contribution={}",
+                    bucket.start(),
+                    bucket.end(),
+                    bucket.count(),
+                    bucket_mid,
+                    contribution
+                );
                 computed_sum += contribution;
             }
         }
@@ -764,15 +786,15 @@ mod tests {
 
         // Add values spanning several orders of magnitude (simulating nanosecond latencies)
         let test_values: Vec<u64> = vec![
-            1_000,        // 1 microsecond
-            5_000,        // 5 microseconds
-            10_000,       // 10 microseconds
-            50_000,       // 50 microseconds
-            100_000,      // 100 microseconds
-            500_000,      // 500 microseconds
-            1_000_000,    // 1 millisecond
-            5_000_000,    // 5 milliseconds
-            10_000_000,   // 10 milliseconds
+            1_000,      // 1 microsecond
+            5_000,      // 5 microseconds
+            10_000,     // 10 microseconds
+            50_000,     // 50 microseconds
+            100_000,    // 100 microseconds
+            500_000,    // 500 microseconds
+            1_000_000,  // 1 millisecond
+            5_000_000,  // 5 milliseconds
+            10_000_000, // 10 milliseconds
         ];
 
         for &v in &test_values {
@@ -788,8 +810,16 @@ mod tests {
         assert!(negative_counts.is_empty(), "Should have no negative values");
 
         // Verify the offset is reasonable (should be around log2(1000) * 2^7 = ~1275)
-        assert!(offset > 1000, "Offset should be > 1000 for values starting at 1000, got {}", offset);
-        assert!(offset < 2000, "Offset should be < 2000 for values starting at 1000, got {}", offset);
+        assert!(
+            offset > 1000,
+            "Offset should be > 1000 for values starting at 1000, got {}",
+            offset
+        );
+        assert!(
+            offset < 2000,
+            "Offset should be < 2000 for values starting at 1000, got {}",
+            offset
+        );
 
         // Verify bucket count interpretation using OTel formula
         // For OTel, bucket i covers [base^(offset+i), base^(offset+i+1))
@@ -802,14 +832,18 @@ mod tests {
 
         println!("Scale: {}", scale);
         println!("Offset: {}", offset);
-        println!("First bucket range: [{:.2}, {:.2})", first_bucket_lower, first_bucket_upper);
+        println!(
+            "First bucket range: [{:.2}, {:.2})",
+            first_bucket_lower, first_bucket_upper
+        );
         println!("First test value: {}", test_values[0]);
 
         // The first bucket's range should contain or be close to 1000
         assert!(
             first_bucket_lower <= 1100.0 && first_bucket_upper >= 900.0,
             "First bucket [{:.2}, {:.2}) should be near 1000",
-            first_bucket_lower, first_bucket_upper
+            first_bucket_lower,
+            first_bucket_upper
         );
 
         println!("Bucket counts: {:?}", positive_counts);
@@ -823,8 +857,7 @@ mod tests {
 
         // Add known values
         let test_values: Vec<u64> = vec![
-            1_000, 2_000, 3_000, 4_000, 5_000,
-            6_000, 7_000, 8_000, 9_000, 10_000,
+            1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000,
         ];
 
         for &v in &test_values {
@@ -852,13 +885,17 @@ mod tests {
 
         // True p50 for [1000..10000] is 5000-6000
         let error_pct = ((p50_est - 5500.0) / 5500.0 * 100.0).abs();
-        println!("P50 estimate: {:.0}, expected ~5500, error: {:.2}%", p50_est, error_pct);
+        println!(
+            "P50 estimate: {:.0}, expected ~5500, error: {:.2}%",
+            p50_est, error_pct
+        );
 
         // Should be within 10% (histogram bucket quantization)
         assert!(
             error_pct < 10.0,
             "P50 estimate {:.0} should be within 10% of 5500, got {:.2}% error",
-            p50_est, error_pct
+            p50_est,
+            error_pct
         );
     }
 }
