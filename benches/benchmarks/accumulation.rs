@@ -1,15 +1,24 @@
 use criterion::Criterion;
-use exponential_histogram::ExponentialHistogram;
+use exponential_histogram::{ExponentialHistogram, SharedExponentialHistogram};
 
 pub fn accumulate(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("histograms");
     group.throughput(criterion::Throughput::Elements(1));
 
-    let mut histogram = ExponentialHistogram::new_with_max_buckets(8, 40);
+    let histogram = ExponentialHistogram::new_with_max_buckets(8, 40);
     group.bench_function("exponential", |bencher| {
         let mut i = 1;
         bencher.iter(|| {
             histogram.accumulate(i);
+            i = (i + 1) % 1000000;
+        });
+    });
+
+    let histogram = SharedExponentialHistogram::default();
+    group.bench_function("shared-exponential", |bencher| {
+        let mut i = 1;
+        bencher.iter(|| {
+            histogram.accumulate(i as f64);
             i = (i + 1) % 1000000;
         });
     });

@@ -1,49 +1,30 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::exponential_histogram::ExponentialHistogram;
+use crate::ExponentialHistogram;
 
+/// An ExponentialHistogram with interior mutability
+#[derive(Debug, Clone, Default)]
 pub struct SharedExponentialHistogram {
-    inner: Arc<Mutex<ExponentialHistogram>>,
-}
-
-impl Default for SharedExponentialHistogram {
-    fn default() -> Self {
-        Self::new(0)
-    }
+    inner: Arc<ExponentialHistogram>,
 }
 
 impl SharedExponentialHistogram {
-    pub fn new(desired_scale: i32) -> Self {
-        Self::new_with_max_buckets(desired_scale, 160)
-    }
-
-    pub fn new_with_max_buckets(desired_scale: i32, _ignored: u16) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ExponentialHistogram::new(desired_scale))),
-        }
-    }
-
+    /// Observe a value, increasing its bucket's count by 1
+    #[inline]
     pub fn accumulate(&self, value: f64) {
-        if let Ok(mut hist) = self.inner.lock() {
-            hist.accumulate(value);
-        }
+        self.inner.accumulate(value);
     }
 
+    /// Get the current snapshot of the histogram. This gives you an owned clone of the backing histogram
+    /// at a point in time, so you can work with it without holding a lock.
     pub fn snapshot(&self) -> ExponentialHistogram {
-        if let Ok(hist) = self.inner.lock() {
-            hist.clone()
-        } else {
-            ExponentialHistogram::default()
-        }
+        self.inner.as_ref().clone()
     }
 
+    /// Get the current snapshot of the histogram and reset the histogram to zero.
+    /// Note: snapshot_and_reset is not supported with the current Arc-based design.
+    /// This method just returns a snapshot. To reset, create a new SharedExponentialHistogram.
     pub fn snapshot_and_reset(&self) -> ExponentialHistogram {
-        if let Ok(mut hist) = self.inner.lock() {
-            let snapshot = hist.clone();
-            hist.reset();
-            snapshot
-        } else {
-            ExponentialHistogram::default()
-        }
+        self.inner.as_ref().clone()
     }
 }
