@@ -6,15 +6,24 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwap;
 use itertools::Itertools;
 
 /// Pre-allocated capacity to avoid allocations in hot path
 const INITIAL_CAPACITY: usize = 256;
 
+/// Maximum capacity to prevent unbounded growth
+const MAX_CAPACITY: usize = 16384;
+
+/// Growth factor when resizing
+const GROWTH_FACTOR: usize = 2;
+
 // In place of histogram::Histogram
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct InnerHistogram {
-    bucket_counts: Arc<Box<[AtomicU64]>>,
+    bucket_counts: ArcSwap<Box<[AtomicU64]>>,
+    // Current capacity of the bucket array
+    capacity: AtomicI32,
     // The index of the first entry of OTel data in bucket_counts
     offset: AtomicI32,
     // Our data lies between min_boundry and max_boundry
@@ -24,10 +33,27 @@ pub(crate) struct InnerHistogram {
     initialized: AtomicBool,
 }
 
+impl Default for InnerHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Clone for InnerHistogram {
     fn clone(&self) -> Self {
+        let capacity = self.capacity();
+        let buckets = self.bucket_counts.load();
+
+        // Create new bucket array by copying values from old buckets
+        let mut new_buckets = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            let count = buckets[i].load(Ordering::Acquire);
+            new_buckets.push(AtomicU64::new(count));
+        }
+
         Self {
-            bucket_counts: self.bucket_counts.clone(),
+            bucket_counts: ArcSwap::from_pointee(new_buckets.into()),
+            capacity: (capacity as i32).into(),
             offset: self.offset.load(Ordering::Acquire).into(),
             min_boundary: self.min_boundary.load(Ordering::Acquire).into(),
             max_boundary: self.max_boundary.load(Ordering::Acquire).into(),
@@ -42,7 +68,8 @@ impl InnerHistogram {
         buckets.resize_with(INITIAL_CAPACITY, || AtomicU64::new(0));
 
         Self {
-            bucket_counts: Arc::new(buckets.into()),
+            bucket_counts: ArcSwap::from_pointee(buckets.into()),
+            capacity: (INITIAL_CAPACITY as i32).into(),
             offset: 0.into(),
             min_boundary: 0.into(),
             max_boundary: 0.into(),
@@ -50,8 +77,138 @@ impl InnerHistogram {
         }
     }
 
+    /// Grow the bucket array to accommodate the given required capacity
+    /// Returns true if growth occurred
+    fn grow_if_needed(&self, required_capacity: usize) -> bool {
+        let current_capacity = self.capacity();
+
+        if required_capacity <= current_capacity {
+            return false; // No growth needed
+        }
+
+        // Calculate new capacity
+        let mut new_capacity = current_capacity;
+        while new_capacity < required_capacity {
+            new_capacity = (new_capacity * GROWTH_FACTOR).min(MAX_CAPACITY);
+            if new_capacity >= MAX_CAPACITY {
+                break;
+            }
+        }
+
+        // Cap at MAX_CAPACITY
+        new_capacity = new_capacity.min(MAX_CAPACITY);
+
+        if new_capacity <= current_capacity {
+            return false; // Already at max or no growth possible
+        }
+
+        // Try to atomically update capacity
+        match self.capacity.compare_exchange(
+            current_capacity as i32,
+            new_capacity as i32,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // We won the race, perform the actual growth
+                let old_buckets = self.bucket_counts.load();
+
+                // Create new bucket array
+                let mut new_buckets = Vec::with_capacity(new_capacity);
+
+                // Copy existing buckets
+                for i in 0..current_capacity {
+                    let count = old_buckets[i].load(Ordering::Acquire);
+                    new_buckets.push(AtomicU64::new(count));
+                }
+
+                // Fill remaining with zeros
+                new_buckets.resize_with(new_capacity, || AtomicU64::new(0));
+
+                // Swap in the new bucket array
+                self.bucket_counts.store(Arc::new(new_buckets.into()));
+
+                true
+            }
+            Err(_) => {
+                // Someone else is growing, they'll handle it
+                false
+            }
+        }
+    }
+
+    /// Grow and shift buckets when adding a value with negative index that requires expansion
+    fn grow_and_shift(&self, new_offset: i32, shift: usize, required_capacity: usize) -> bool {
+        let current_capacity = self.capacity();
+
+        // Calculate new capacity
+        let mut new_capacity = current_capacity;
+        while new_capacity < required_capacity {
+            new_capacity = (new_capacity * GROWTH_FACTOR).min(MAX_CAPACITY);
+            if new_capacity >= MAX_CAPACITY {
+                break;
+            }
+        }
+        new_capacity = new_capacity.min(MAX_CAPACITY);
+
+        if new_capacity <= current_capacity {
+            return false;
+        }
+
+        // Try to atomically update both capacity and offset
+        match self.capacity.compare_exchange(
+            current_capacity as i32,
+            new_capacity as i32,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // We won the race
+                let old_buckets = self.bucket_counts.load();
+
+                // Create new bucket array with shift
+                let mut new_buckets = Vec::with_capacity(new_capacity);
+
+                // Fill shift amount with zeros
+                for _ in 0..shift {
+                    new_buckets.push(AtomicU64::new(0));
+                }
+
+                // Copy existing buckets (shifted by 'shift' positions)
+                for i in 0..current_capacity {
+                    let count = old_buckets[i].load(Ordering::Acquire);
+                    new_buckets.push(AtomicU64::new(count));
+
+                    if new_buckets.len() >= new_capacity {
+                        break;
+                    }
+                }
+
+                // Fill remaining with zeros
+                while new_buckets.len() < new_capacity {
+                    new_buckets.push(AtomicU64::new(0));
+                }
+
+                // Update offset
+                self.offset.store(new_offset, Ordering::Release);
+
+                // Swap in the new bucket array
+                self.bucket_counts.store(Arc::new(new_buckets.into()));
+
+                true
+            }
+            Err(_) => {
+                // Someone else is growing
+                false
+            }
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn increment(&self, otel_index: i32) {
+        // Load bucket pointer once for fast path
+        let buckets = self.bucket_counts.load();
+
         if !self.initialized.load(Ordering::Acquire) {
             if self
                 .initialized
@@ -61,139 +218,154 @@ impl InnerHistogram {
                 self.offset.store(otel_index, Ordering::Release);
                 self.min_boundary.store(otel_index, Ordering::Release);
                 self.max_boundary.store(otel_index, Ordering::Release);
-                self.bucket_counts[0].store(1, Ordering::Release);
+                buckets[0].store(1, Ordering::Release);
+                return;
+            }
+            // Race lost - call slow path
+            return self.increment_slow(otel_index);
+        }
+
+        // Fast path - single load of offset and capacity
+        let offset = self.offset.load(Ordering::Relaxed);
+        let capacity = self.capacity.load(Ordering::Relaxed) as usize;
+        let index = otel_index - offset;
+
+        // Fast path: positive index within capacity
+        if index >= 0 {
+            let idx = index as usize;
+            if idx < capacity {
+                buckets[idx].fetch_add(1, Ordering::Relaxed);
+                self.update_min_boundary(otel_index);
+                self.update_max_boundary(otel_index);
                 return;
             }
         }
 
+        // Slow path - needs growth or special handling
+        self.increment_slow(otel_index);
+    }
+
+    // Slow path - not inlined to keep fast path small
+    #[inline(never)]
+    fn increment_slow(&self, otel_index: i32) {
         let offset = self.offset.load(Ordering::Acquire);
         let index = otel_index - offset;
 
         if index < 0 {
-            let shift = -index;
+            // Need to expand downward (shift offset)
+            let shift = (-index) as usize;
+            let current_capacity = self.capacity();
+            let max_boundary = self.max_boundary.load(Ordering::Acquire);
+            let required_span = (max_boundary - otel_index + 1) as usize;
 
-            if shift < INITIAL_CAPACITY as i32 {
-                let new_offset = otel_index;
+            // Check if we need to grow and/or shift
+            if required_span > current_capacity {
+                self.grow_and_shift(otel_index, shift, required_span);
+
+                // After growth, add to bucket[0]
+                let buckets = self.bucket_counts.load();
+                buckets[0].fetch_add(1, Ordering::Relaxed);
+                self.update_min_boundary(otel_index);
+                return;
+            }
+
+            // Try to update offset (shift within current capacity)
+            let new_capacity = self.capacity();
+            if shift < new_capacity {
                 match self.offset.compare_exchange(
                     offset,
-                    new_offset,
+                    otel_index,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        // Increment the offset
-                        self.bucket_counts[0].fetch_add(1, Ordering::Relaxed);
+                        let buckets = self.bucket_counts.load();
+                        buckets[0].fetch_add(1, Ordering::Relaxed);
 
-                        // Update min bondary
-                        let mut old_min = self.min_boundary.load(Ordering::Relaxed);
-                        // Keep trying until we succeed
-                        while otel_index < old_min {
-                            match self.min_boundary.compare_exchange_weak(
-                                old_min,
-                                otel_index,
-                                Ordering::Release,
-                                Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break,
-                                Err(x) => old_min = x,
-                            }
-                        }
+                        self.update_min_boundary(otel_index);
                         return;
                     }
                     Err(current_offset) => {
-                        // Someone else updated the offset, retry with new offset
+                        // Retry with new offset
                         let index = otel_index - current_offset;
-
-                        // If still negative after retry, just cap at bucket[0]
                         if index < 0 {
-                            self.bucket_counts[0].fetch_add(1, Ordering::Relaxed);
-
-                            let mut old_min = self.min_boundary.load(Ordering::Relaxed);
-                            while otel_index < old_min {
-                                match self.min_boundary.compare_exchange_weak(
-                                    old_min,
-                                    otel_index,
-                                    Ordering::Release,
-                                    Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(x) => old_min = x,
-                                }
-                            }
+                            // Still negative, cap at bucket[0]
+                            let buckets = self.bucket_counts.load();
+                            buckets[0].fetch_add(1, Ordering::Relaxed);
+                            self.update_min_boundary(otel_index);
                             return;
                         }
-                        // Fall through to normal path if now within bounds
+                        // Fall through if now in bounds
                     }
                 }
             } else {
-                // Shift too large, cap at bucket[0]
-                self.bucket_counts[0].fetch_add(1, Ordering::Relaxed);
-
-                let mut old_min = self.min_boundary.load(Ordering::Relaxed);
-                while otel_index < old_min {
-                    match self.min_boundary.compare_exchange_weak(
-                        old_min,
-                        otel_index,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(x) => old_min = x,
-                    }
-                }
+                // Beyond max capacity, cap at bucket[0]
+                let buckets = self.bucket_counts.load();
+                buckets[0].fetch_add(1, Ordering::Relaxed);
+                self.update_min_boundary(otel_index);
                 return;
             }
         }
 
-        // Fast path, within bounds
-        let index = index as usize;
-        if index < INITIAL_CAPACITY {
-            self.bucket_counts[index].fetch_add(1, Ordering::Relaxed);
+        // Positive index or fell through from negative handling
+        let index = (otel_index - self.offset.load(Ordering::Acquire)) as usize;
+        let current_capacity = self.capacity();
 
-            // Update boundaries
-            let mut old_min = self.min_boundary.load(Ordering::Relaxed);
-            while otel_index < old_min {
-                match self.min_boundary.compare_exchange_weak(
-                    old_min,
-                    otel_index,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => old_min = x,
-                }
-            }
+        if index >= current_capacity {
+            // Need to grow
+            let required_capacity = index + 1;
+            self.grow_if_needed(required_capacity);
 
-            let mut old_max = self.max_boundary.load(Ordering::Relaxed);
-            while otel_index > old_max {
-                match self.max_boundary.compare_exchange_weak(
-                    old_max,
-                    otel_index,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => old_max = x,
-                }
+            // After potential growth, check capacity again
+            let new_capacity = self.capacity();
+            if index < new_capacity {
+                let buckets = self.bucket_counts.load();
+                buckets[index].fetch_add(1, Ordering::Relaxed);
+                self.update_min_boundary(otel_index);
+                self.update_max_boundary(otel_index);
+            } else {
+                // Still beyond capacity (hit MAX_CAPACITY), cap at last bucket
+                let buckets = self.bucket_counts.load();
+                buckets[new_capacity - 1].fetch_add(1, Ordering::Relaxed);
+                self.update_max_boundary(otel_index);
             }
-            return;
-            // Slow path: index beyond capacity - cap at max bucket
         } else {
-            let cap = INITIAL_CAPACITY - 1;
-            self.bucket_counts[cap].fetch_add(1, Ordering::Relaxed);
+            // Within bounds, fast path
+            let buckets = self.bucket_counts.load();
+            buckets[index].fetch_add(1, Ordering::Relaxed);
+            self.update_min_boundary(otel_index);
+            self.update_max_boundary(otel_index);
+        }
+    }
 
-            let capped_index = offset + cap as i32;
-            let mut old_max = self.max_boundary.load(Ordering::Relaxed);
-            while capped_index > old_max {
-                match self.max_boundary.compare_exchange_weak(
-                    old_max,
-                    capped_index,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => old_max = x,
-                }
+    #[inline]
+    fn update_min_boundary(&self, otel_index: i32) {
+        let mut old_min = self.min_boundary.load(Ordering::Relaxed);
+        while otel_index < old_min {
+            match self.min_boundary.compare_exchange_weak(
+                old_min,
+                otel_index,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(x) => old_min = x,
+            }
+        }
+    }
+
+    #[inline]
+    fn update_max_boundary(&self, otel_index: i32) {
+        let mut old_max = self.max_boundary.load(Ordering::Relaxed);
+        while otel_index > old_max {
+            match self.max_boundary.compare_exchange_weak(
+                old_max,
+                otel_index,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(x) => old_max = x,
             }
         }
     }
@@ -213,17 +385,20 @@ impl InnerHistogram {
         }
         let offset = self.offset.load(Ordering::Acquire);
         let max_boundary = self.max_boundary.load(Ordering::Acquire);
-        let end = ((max_boundary - offset + 1) as usize).min(INITIAL_CAPACITY);
+        let capacity = self.capacity.load(Ordering::Acquire);
+        let end = ((max_boundary - offset + 1) as usize).min(capacity as usize);
 
+        let buckets = self.bucket_counts.load();
         let mut sum = 0u64;
         for i in 0..end {
-            sum += self.bucket_counts[i].load(Ordering::Acquire);
+            sum += buckets[i].load(Ordering::Acquire);
         }
         sum
     }
 
     pub fn as_vec_deque(&self) -> VecDeque<usize> {
-        self.bucket_counts
+        let buckets = self.bucket_counts.load();
+        buckets
             .as_ref()
             .iter()
             .map(|cnts| cnts.load(Ordering::Acquire) as usize)
@@ -234,11 +409,16 @@ impl InnerHistogram {
     /// Used in testing
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.bucket_counts.as_ref().len()
+        self.bucket_counts.load().as_ref().len()
     }
 
     #[allow(dead_code)]
     pub fn load(&self, index: usize) -> usize {
-        self.bucket_counts[index].load(Ordering::Acquire) as usize
+        let buckets = self.bucket_counts.load();
+        buckets[index].load(Ordering::Acquire) as usize
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Acquire) as usize
     }
 }

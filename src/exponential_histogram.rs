@@ -235,6 +235,8 @@ fn value_to_otel_index(scale: i32, value: f64) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use histogram::AtomicHistogram;
+
     use crate::{exponential_histogram::value_to_otel_index, shared::*};
 
     use std::time::{Duration, Instant};
