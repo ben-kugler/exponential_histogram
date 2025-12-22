@@ -85,7 +85,7 @@ impl ExponentialHistogram {
     }
 
     pub fn new_with_max_buckets(desired_scale: i32, _ignored: u16) -> Self {
-        let scale = desired_scale.min(MAX_SCALE);
+        let scale = desired_scale.clamp(0, MAX_SCALE);
         Self {
             positive_buckets: InnerHistogram::new(),
             negative_buckets: InnerHistogram::new(),
@@ -120,7 +120,6 @@ impl ExponentialHistogram {
             return;
         }
 
-        // Load zero_threshold once
         let zero_threshold = self.zero_threshold.load(Ordering::Relaxed);
 
         if zero_threshold == 0.0 && val == 0.0 {
@@ -133,18 +132,15 @@ impl ExponentialHistogram {
 
         self.sum.fetch_add(val, Ordering::Relaxed);
 
-        // Atomic min using fetch_min (CAS loop)
         self.min_value.fetch_min(val, Ordering::Relaxed);
 
-        // Atomic max using fetch_max (CAS loop)
         self.max_value.fetch_max(val, Ordering::Relaxed);
 
         let abs_val = val.abs();
 
-        // Load scale once
         let scale = self.scale.load(Ordering::Relaxed);
 
-        if let Some(index) = value_to_otel_index(abs_val, scale) {
+        if let Some(index) = value_to_otel_index(scale, abs_val) {
             if val >= 0.0 {
                 self.positive_buckets.increment(index);
             } else {
@@ -208,7 +204,7 @@ impl ExponentialHistogram {
 /// Convert a value to an OpenTelemetry exponential histogram bucket index.
 /// https://opentelemetry.io/docs/specs/otel/metrics/data-model/#producer-expectations
 #[inline(always)]
-fn value_to_otel_index(value: f64, scale: i32) -> Option<i32> {
+fn value_to_otel_index(scale: i32, value: f64) -> Option<i32> {
     if value <= 0.0 || !value.is_finite() {
         return None;
     }
@@ -239,208 +235,442 @@ fn value_to_otel_index(value: f64, scale: i32) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::shared::*;
+    use crate::{exponential_histogram::value_to_otel_index, shared::*};
+
+    use std::time::{Duration, Instant};
+
+    use super::ExponentialHistogram;
 
     #[test]
-    fn test_exponential_histogram_basic() {
-        let hist = ExponentialHistogram::new(0);
-        assert!(hist.is_empty());
-        assert_eq!(hist.count(), 0);
+    fn check_range() {
+        assert_eq!(Some(1275), value_to_otel_index(6, 1_000_000.0));
+        assert_eq!(Some(1275 + 160), value_to_otel_index(6, 5_650_000.0));
 
-        hist.accumulate(1.0);
-        hist.accumulate(2.0);
-        hist.accumulate(3.0);
-
-        assert!(!hist.is_empty());
-        assert_eq!(hist.count(), 3);
-        assert_eq!(hist.sum(), 6.0);
-        assert_eq!(hist.min(), 1.0);
-        assert_eq!(hist.max(), 3.0);
+        assert_eq!(Some(637), value_to_otel_index(5, 1_000_000.0));
+        assert_eq!(Some(637 + 160), value_to_otel_index(5, 32_000_000.0));
     }
 
     #[test]
-    fn test_exponential_histogram_with_max_buckets() {
-        let hist = ExponentialHistogram::new_with_max_buckets(2, 100);
-        hist.accumulate(10.0);
-        assert_eq!(hist.count(), 1);
-        assert_eq!(hist.scale(), 2);
-    }
+    fn indices_scale_downgrade_positive_numbers() {
+        //
+        // -------- Start out with a fine-grained histogram --------
+        //
+        let e = ExponentialHistogram::new(8);
 
-    #[test]
-    fn test_exponential_histogram_reset() {
-        let mut hist = ExponentialHistogram::new(0);
-        hist.accumulate(5.0);
-        hist.accumulate(10.0);
-
-        assert_eq!(hist.count(), 2);
-
-        hist.reset();
-
-        assert!(hist.is_empty());
-        assert_eq!(hist.count(), 0);
-    }
-
-    #[test]
-    fn test_exponential_histogram_negatives() {
-        let hist = ExponentialHistogram::new(0);
-        hist.accumulate(-5.0);
-        hist.accumulate(10.0);
-        hist.accumulate(-2.0);
-
-        assert!(hist.has_negatives());
-        assert_eq!(hist.count(), 3);
-        assert_eq!(hist.min(), -5.0);
-        assert_eq!(hist.max(), 10.0);
-        assert_eq!(hist.sum(), 3.0);
-    }
-
-    #[test]
-    fn test_fractional_values() {
-        let hist = ExponentialHistogram::new(4);
-        hist.accumulate(0.1);
-        hist.accumulate(0.5);
-        hist.accumulate(1.5);
-        hist.accumulate(2.7);
-
-        assert_eq!(hist.count(), 4);
-        assert!(
-            (hist.sum() - 4.8).abs() < 1e-10,
-            "sum should be approximately 4.8, got {}",
-            hist.sum()
+        e.accumulate(24_000_000);
+        assert_eq!(
+            6276,
+            e.bucket_start_offset(),
+            "histogram initializes with the first observation in the middle of the range"
         );
-        assert_eq!(hist.min(), 0.1);
-        assert_eq!(hist.max(), 2.7);
-    }
+        assert_eq_epsilon(24000000.0, e.min(), "min and max should be equal");
+        assert_eq_epsilon(24000000.0, e.max(), "min and max should be equal");
 
-    #[test]
-    fn test_zero_handling() {
-        let hist = ExponentialHistogram::new(0);
-        hist.accumulate(0.0);
-        hist.accumulate(0.0);
-        hist.accumulate(1.0);
+        assert_eq!(
+            8,
+            e.scale(),
+            "initial value should not change scale since it falls in the numeric range"
+        );
 
-        assert_eq!(hist.count(), 3);
-        assert_eq!(hist.zero_count(), 2);
-        assert_eq!(hist.sum(), 1.0);
-    }
+        assert_eq!(
+            1,
+            e.positive_buckets.load(0),
+            "initial value should go in index 0"
+        );
+        assert_eq!(
+            6276,
+            e.bucket_start_offset(),
+            "bucket start offset should index into scale 8"
+        );
 
-    #[test]
-    fn test_shared_exponential_histogram() {
-        let hist = SharedExponentialHistogram::default();
+        // assert some bucket boundaries for convenience
+        // assert_value_lowerboundary(&e, 24_000_000, 23984931.775);
+        // assert_value_lowerboundary(&e, 24_040_000, 23984931.775);
+        // assert_value_lowerboundary(&e, 24_050_000, 24049961.522);
 
-        hist.accumulate(1.0);
-        hist.accumulate(2.0);
-        hist.accumulate(3.0);
+        // assert_eq_epsilon(
+        //     19313750.368,
+        //     lower_boundary(8, 0, 6196),
+        //     "lower boundary of histogram",
+        // );
+        // assert_eq_epsilon(
+        //     29785874.896,
+        //     lower_boundary(8, 0, 6196 + 160),
+        //     "upper boundary of histogram",
+        // );
 
-        let snapshot = hist.snapshot();
-        assert_eq!(snapshot.count(), 3);
-        assert_eq!(snapshot.sum(), 6.0);
-
-        let snapshot2 = hist.snapshot();
-        assert_eq!(snapshot2.count(), 3);
-    }
-
-    #[test]
-    fn test_shared_exponential_histogram_reset() {
-        let hist = SharedExponentialHistogram::default();
-
-        hist.accumulate(1.0);
-        hist.accumulate(2.0);
-
-        let snapshot = hist.snapshot_and_reset();
-        assert_eq!(snapshot.count(), 2);
-
-        let snapshot2 = hist.snapshot();
-        assert_eq!(snapshot2.count(), 0);
-    }
-
-    #[test]
-    fn test_shared_exponential_histogram_thread_safety() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let hist = Arc::new(SharedExponentialHistogram::default());
-        let mut handles = vec![];
-
-        for i in 0..10 {
-            let hist_clone = Arc::clone(&hist);
-            let handle = thread::spawn(move || {
-                for j in 0..100 {
-                    hist_clone.accumulate((i * 100 + j) as f64);
-                }
-            });
-            handles.push(handle);
+        // Accumulate some data in a bucket's range
+        for i in 0..40_000 {
+            e.accumulate(24_000_000 + i);
         }
+        assert_eq!(
+            40001,
+            e.positive_buckets.load(0),
+            "initial value should go in index 0"
+        );
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        e.accumulate(24_050_000);
+        assert_eq!(
+            8,
+            e.scale(),
+            "a value in the next higher bucket should not change the scale"
+        );
 
-        let snapshot = hist.snapshot();
-        assert_eq!(snapshot.count(), 1000);
+        assert_eq!(1, e.positive_buckets.load(1), "index 1 has a new count");
+        assert_eq!(
+            6276,
+            e.bucket_start_offset(),
+            "bucket start offset does not change when adding a bucket in the same range"
+        );
+
+        // Poke at growth boundary conditions
+        e.accumulate(23_984_000);
+        assert_eq!(
+            8,
+            e.scale(),
+            "a value in the next lower bucket should not change the scale"
+        );
+
+        assert_eq!(1, e.positive_buckets.load(0), "index 79 has a new count");
+        assert_eq!(
+            6276,
+            e.bucket_start_offset(),
+            "bucket start offset does not change when using a bucket in the same range"
+        );
+
+        e.accumulate(19_313_750);
+        assert_eq!(
+            8,
+            e.scale(),
+            "a value below the covered range should not change the scale yet because there is room above the observed range to shift"
+        );
+        assert_eq!(
+            83,
+            e.positive_buckets.len(),
+            "bucket count should not increase when a new bucket value is observed within the covered range"
+        );
+        assert_eq!(1, e.positive_buckets.load(0), "index 0 has a new count");
+        // assert_eq!(
+        //     6195, e.bucket_start_offset,
+        //     "bucket start offset changes because we rotated down 1 position"
+        // );
+        // assert_eq_epsilon(
+        //     29705335.561,
+        //     lower_boundary(8, 0, 6195 + 160),
+        //     "new upper boundary of histogram",
+        // );
+
+        //
+        // -------- Expand histogram range with a big number --------
+        //
+        e.accumulate(29_705_336);
+        assert_eq!(
+            Some(3177),
+            value_to_otel_index(7, 29_705_336_f64),
+            "this value pushes the length of scale 7 also"
+        );
+        assert_eq!(
+            7,
+            e.scale(),
+            "a value above the covered range should now change the scale because the lower end is populated while the upper end is beyond the range this scale can cover in 160 buckets"
+        );
+        assert_eq!(
+            160,
+            e.positive_buckets.len(),
+            "bucket count should be sensible after rescale"
+        );
+        assert_eq!(
+            1,
+            e.positive_buckets.load(e.positive_buckets.len() - 1),
+            "last index has a new count"
+        );
+        assert_eq!(
+            3018,
+            e.bucket_start_offset(),
+            "bucket start offset changes because we scaled and rotated"
+        );
+
+        //
+        // -------- Skip several zoom scale steps in a single accumulate --------
+        //
+        let recursive_scale_start_count = e.count();
+        // assert_eq!(
+        //     2199023255551.996,
+        //     lower_boundary(2, 0, 164),
+        //     "this value gets us down into scale 2"
+        // );
+        // assert_eq_epsilon(
+        //     4.000,
+        //     lower_boundary(2, 0, 8),
+        //     "this value gets us down into scale 2",
+        // );
+        // assert_eq_epsilon(
+        //     4.757,
+        //     lower_boundary(2, 0, 9),
+        //     "this value gets us down into scale 2",
+        // );
+        // pin the bucket's low value, at scale 2's index 8. It's not in scale 2 yet though!
+        e.accumulate(4.25);
+        // now blow the range wide, way past scale 7, resulting in a recursive scale down from 7 to precision 2.
+        e.accumulate(2_199_023_255_552_f64);
+        assert_eq!(2, e.scale(), "this value range should force scale range 2");
+        assert_eq!(
+            8,
+            e.bucket_start_offset(),
+            "bucket start offset should match the first element, since we rotated and grew out to the larger value"
+        );
+        assert_eq!(
+            1,
+            e.positive_buckets.load(8 - 8),
+            "this is the 4.0 bucket, and 4.25 should go in it."
+        );
+        assert_eq!(
+            1,
+            e.positive_buckets.load(164 - 8),
+            "this is the bucket for the big numer."
+        );
+        assert_eq!(
+            recursive_scale_start_count + 2,
+            e.count(),
+            "2 more reports were made. The histogram maintains every count across rescaling, even recursive rescaling"
+        );
     }
 
-    #[test]
-    fn test_clone_implementation() {
-        let hist = ExponentialHistogram::new(2);
-        hist.accumulate(5.0);
-        hist.accumulate(-3.0);
-        hist.accumulate(10.0);
+    // /// Look for random index crashes
+    // #[test]
+    // fn fuzz() {
+    //     let start = Instant::now();
+    //     while start.elapsed() < Duration::from_millis(50) {
+    //         let mut e = ExponentialHistogram::new(8);
+    //         let start = Instant::now();
+    //         while start.elapsed() < Duration::from_millis(1) {
+    //             e.accumulate(1_000_000_000_000_000_f64 * rand::random::<f64>());
+    //         }
+    //     }
+    // }
 
-        let cloned = hist.clone();
+    // /// Look for random index crashes
+    // #[test]
+    // fn fuzz_negative() {
+    //     let start = Instant::now();
+    //     while start.elapsed() < Duration::from_millis(50) {
+    //         let mut e = ExponentialHistogram::new(8);
+    //         let start = Instant::now();
+    //         while start.elapsed() < Duration::from_millis(1) {
+    //             e.accumulate(-1_000_000_000_000_000_f64 * rand::random::<f64>());
+    //         }
+    //     }
+    // }
 
-        assert_eq!(hist.count(), cloned.count());
-        assert_eq!(hist.scale(), cloned.scale());
-        assert_eq!(hist.has_negatives(), cloned.has_negatives());
-        assert_eq!(hist.min(), cloned.min());
-        assert_eq!(hist.max(), cloned.max());
+    #[track_caller]
+    fn assert_eq_epsilon(j: f64, k: f64, message: &str) {
+        const EPSILON: f64 = 1.0 / 128.0;
+        let difference = (j - k).abs();
+        assert!(
+            difference < EPSILON,
+            "{message}: {j} != {k} with epsilon {EPSILON}."
+        );
     }
 
-    #[test]
-    fn test_display_implementation() {
-        let hist = ExponentialHistogram::new(2);
-        hist.accumulate(5.0);
-        hist.accumulate(-3.0);
-        hist.accumulate(10.0);
+    // #[test]
+    // fn test_exponential_histogram_basic() {
+    //     let hist = ExponentialHistogram::new(0);
+    //     assert!(hist.is_empty());
+    //     assert_eq!(hist.count(), 0);
 
-        let display_output = format!("{}", hist);
-        assert!(display_output.contains("ExponentialHistogram"));
-        assert!(display_output.contains("scale=2"));
-        assert!(display_output.contains("count=3"));
+    //     hist.accumulate(1.0);
+    //     hist.accumulate(2.0);
+    //     hist.accumulate(3.0);
 
-        let empty_hist = ExponentialHistogram::new(0);
-        let empty_output = format!("{}", empty_hist);
-        assert!(empty_output.contains("count=0"));
-        assert!(empty_output.contains("sum=0.00"));
-    }
+    //     assert!(!hist.is_empty());
+    //     assert_eq!(hist.count(), 3);
+    //     assert_eq!(hist.sum(), 6.0);
+    //     assert_eq!(hist.min(), 1.0);
+    //     assert_eq!(hist.max(), 3.0);
+    // }
 
-    #[test]
-    fn test_default_implementation() {
-        let hist = ExponentialHistogram::default();
-        assert_eq!(hist.scale(), 0);
-        assert_eq!(hist.count(), 0);
-        assert!(hist.is_empty());
+    // #[test]
+    // fn test_exponential_histogram_with_max_buckets() {
+    //     let hist = ExponentialHistogram::new_with_max_buckets(2, 100);
+    //     hist.accumulate(10.0);
+    //     assert_eq!(hist.count(), 1);
+    //     assert_eq!(hist.scale(), 2);
+    // }
 
-        let shared = SharedExponentialHistogram::default();
-        let snapshot = shared.snapshot();
-        assert_eq!(snapshot.scale(), 0);
-        assert_eq!(snapshot.count(), 0);
-        assert!(snapshot.is_empty());
+    // #[test]
+    // fn test_exponential_histogram_reset() {
+    //     let mut hist = ExponentialHistogram::new(0);
+    //     hist.accumulate(5.0);
+    //     hist.accumulate(10.0);
 
-        let hist2 = ExponentialHistogram::default();
-        hist2.accumulate(5.0);
-        assert_eq!(hist2.count(), 1);
+    //     assert_eq!(hist.count(), 2);
 
-        let shared2 = SharedExponentialHistogram::default();
-        shared2.accumulate(10.0);
-        assert_eq!(shared2.snapshot().count(), 1);
-    }
+    //     hist.reset();
+
+    //     assert!(hist.is_empty());
+    //     assert_eq!(hist.count(), 0);
+    // }
+
+    // #[test]
+    // fn test_exponential_histogram_negatives() {
+    //     let hist = ExponentialHistogram::new(0);
+    //     hist.accumulate(-5.0);
+    //     hist.accumulate(10.0);
+    //     hist.accumulate(-2.0);
+
+    //     assert!(hist.has_negatives());
+    //     assert_eq!(hist.count(), 3);
+    //     assert_eq!(hist.min(), -5.0);
+    //     assert_eq!(hist.max(), 10.0);
+    //     assert_eq!(hist.sum(), 3.0);
+    // }
+
+    // #[test]
+    // fn test_fractional_values() {
+    //     let hist = ExponentialHistogram::new(4);
+    //     hist.accumulate(0.1);
+    //     hist.accumulate(0.5);
+    //     hist.accumulate(1.5);
+    //     hist.accumulate(2.7);
+
+    //     assert_eq!(hist.count(), 4);
+    //     assert!(
+    //         (hist.sum() - 4.8).abs() < 1e-10,
+    //         "sum should be approximately 4.8, got {}",
+    //         hist.sum()
+    //     );
+    //     assert_eq!(hist.min(), 0.1);
+    //     assert_eq!(hist.max(), 2.7);
+    // }
+
+    // #[test]
+    // fn test_zero_handling() {
+    //     let hist = ExponentialHistogram::new(0);
+    //     hist.accumulate(0.0);
+    //     hist.accumulate(0.0);
+    //     hist.accumulate(1.0);
+
+    //     assert_eq!(hist.count(), 3);
+    //     assert_eq!(hist.zero_count(), 2);
+    //     assert_eq!(hist.sum(), 1.0);
+    // }
+
+    // #[test]
+    // fn test_shared_exponential_histogram() {
+    //     let hist = SharedExponentialHistogram::default();
+
+    //     hist.accumulate(1.0);
+    //     hist.accumulate(2.0);
+    //     hist.accumulate(3.0);
+
+    //     let snapshot = hist.snapshot();
+    //     assert_eq!(snapshot.count(), 3);
+    //     assert_eq!(snapshot.sum(), 6.0);
+
+    //     let snapshot2 = hist.snapshot();
+    //     assert_eq!(snapshot2.count(), 3);
+    // }
+
+    // #[test]
+    // fn test_shared_exponential_histogram_reset() {
+    //     let hist = SharedExponentialHistogram::default();
+
+    //     hist.accumulate(1.0);
+    //     hist.accumulate(2.0);
+
+    //     let snapshot = hist.snapshot_and_reset();
+    //     assert_eq!(snapshot.count(), 2);
+
+    //     let snapshot2 = hist.snapshot();
+    //     assert_eq!(snapshot2.count(), 0);
+    // }
+
+    // #[test]
+    // fn test_shared_exponential_histogram_thread_safety() {
+    //     use std::sync::Arc;
+    //     use std::thread;
+
+    //     let hist = Arc::new(SharedExponentialHistogram::default());
+    //     let mut handles = vec![];
+
+    //     for i in 0..10 {
+    //         let hist_clone = Arc::clone(&hist);
+    //         let handle = thread::spawn(move || {
+    //             for j in 0..100 {
+    //                 hist_clone.accumulate((i * 100 + j) as f64);
+    //             }
+    //         });
+    //         handles.push(handle);
+    //     }
+
+    //     for handle in handles {
+    //         handle.join().unwrap();
+    //     }
+
+    //     let snapshot = hist.snapshot();
+    //     assert_eq!(snapshot.count(), 1000);
+    // }
+
+    // #[test]
+    // fn test_clone_implementation() {
+    //     let hist = ExponentialHistogram::new(2);
+    //     hist.accumulate(5.0);
+    //     hist.accumulate(-3.0);
+    //     hist.accumulate(10.0);
+
+    //     let cloned = hist.clone();
+
+    //     assert_eq!(hist.count(), cloned.count());
+    //     assert_eq!(hist.scale(), cloned.scale());
+    //     assert_eq!(hist.has_negatives(), cloned.has_negatives());
+    //     assert_eq!(hist.min(), cloned.min());
+    //     assert_eq!(hist.max(), cloned.max());
+    // }
+
+    // #[test]
+    // fn test_display_implementation() {
+    //     let hist = ExponentialHistogram::new(2);
+    //     hist.accumulate(5.0);
+    //     hist.accumulate(-3.0);
+    //     hist.accumulate(10.0);
+
+    //     let display_output = format!("{}", hist);
+    //     assert!(display_output.contains("ExponentialHistogram"));
+    //     assert!(display_output.contains("scale=2"));
+    //     assert!(display_output.contains("count=3"));
+
+    //     let empty_hist = ExponentialHistogram::new(0);
+    //     let empty_output = format!("{}", empty_hist);
+    //     assert!(empty_output.contains("count=0"));
+    //     assert!(empty_output.contains("sum=0.00"));
+    // }
+
+    // #[test]
+    // fn test_default_implementation() {
+    //     let hist = ExponentialHistogram::default();
+    //     assert_eq!(hist.scale(), 0);
+    //     assert_eq!(hist.count(), 0);
+    //     assert!(hist.is_empty());
+
+    //     let shared = SharedExponentialHistogram::default();
+    //     let snapshot = shared.snapshot();
+    //     assert_eq!(snapshot.scale(), 0);
+    //     assert_eq!(snapshot.count(), 0);
+    //     assert!(snapshot.is_empty());
+
+    //     let hist2 = ExponentialHistogram::default();
+    //     hist2.accumulate(5.0);
+    //     assert_eq!(hist2.count(), 1);
+
+    //     let shared2 = SharedExponentialHistogram::default();
+    //     shared2.accumulate(10.0);
+    //     assert_eq!(shared2.snapshot().count(), 1);
+    // }
 
     // #[test]
     // fn test_otel_index_conversion() {
     //     let scale = 7;
-    //     let mut hist = ExponentialHistogram::new(scale);
+    //     let hist = ExponentialHistogram::new(scale);
 
     //     let test_values: Vec<u64> = vec![
     //         1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000,

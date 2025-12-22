@@ -18,8 +18,8 @@ pub(crate) struct InnerHistogram {
     // The index of the first entry of OTel data in bucket_counts
     offset: AtomicI32,
     // Our data lies between min_boundry and max_boundry
-    min_boundary: AtomicI32,
-    max_boundary: AtomicI32,
+    pub(crate) min_boundary: AtomicI32,
+    pub(crate) max_boundary: AtomicI32,
     // Have we seen any data?
     initialized: AtomicBool,
 }
@@ -69,8 +69,6 @@ impl InnerHistogram {
         let offset = self.offset.load(Ordering::Acquire);
         let index = otel_index - offset;
 
-        // Handle negative index by atomically updating offset
-        // This is the lock-free equivalent of shifting the array
         if index < 0 {
             let shift = -index;
 
@@ -148,10 +146,11 @@ impl InnerHistogram {
         }
 
         // Fast path, within bounds
-        if index >= 0 && (index as usize) < INITIAL_CAPACITY {
-            self.bucket_counts[index as usize].fetch_add(1, Ordering::Relaxed);
+        let index = index as usize;
+        if index < INITIAL_CAPACITY {
+            self.bucket_counts[index].fetch_add(1, Ordering::Relaxed);
 
-            // Update boundaries atomically
+            // Update boundaries
             let mut old_min = self.min_boundary.load(Ordering::Relaxed);
             while otel_index < old_min {
                 match self.min_boundary.compare_exchange_weak(
@@ -178,10 +177,8 @@ impl InnerHistogram {
                 }
             }
             return;
-        }
-
-        // Slow path: index beyond capacity - cap at max bucket
-        if index >= INITIAL_CAPACITY as i32 {
+            // Slow path: index beyond capacity - cap at max bucket
+        } else {
             let cap = INITIAL_CAPACITY - 1;
             self.bucket_counts[cap].fetch_add(1, Ordering::Relaxed);
 
@@ -227,11 +224,21 @@ impl InnerHistogram {
 
     pub fn as_vec_deque(&self) -> VecDeque<usize> {
         self.bucket_counts
-            .clone()
             .as_ref()
             .iter()
             .map(|cnts| cnts.load(Ordering::Acquire) as usize)
             .collect_vec()
             .into()
+    }
+
+    /// Used in testing
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.bucket_counts.as_ref().len()
+    }
+
+    #[allow(dead_code)]
+    pub fn load(&self, index: usize) -> usize {
+        self.bucket_counts[index].load(Ordering::Acquire) as usize
     }
 }
