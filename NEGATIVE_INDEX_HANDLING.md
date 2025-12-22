@@ -1,12 +1,6 @@
 # Negative OTel Index Handling
 
-## Question
-**Does this implementation handle OTel negative index values?**
-
-## Answer
-**Yes! ✅** The implementation on the `correctness-investigation` branch correctly handles negative OTel bucket indices.
-
-## How It Works
+## Thanks Claude
 
 ### OTel Index Calculation
 

@@ -40,7 +40,7 @@ histograms/shared-exponential
                         thrpt:  [102.74 Melem/s 103.87 Melem/s 104.89 Melem/s]
 ```
 
-### brayniac#correctness-investigation#554646d6d15e2404b758a98bcc0ad02152b427a4
+### brayniac#correctness-investigation#168ae0d843f7f2a582f147ff2c65820b84ec44b5
 ```
 histograms/exponential  time:   [16.700 ns 16.719 ns 16.742 ns]
                         thrpt:  [59.732 Melem/s 59.814 Melem/s 59.880 Melem/s]
@@ -48,6 +48,17 @@ histograms/exponential  time:   [16.700 ns 16.719 ns 16.742 ns]
 histograms/shared-exponential
                         time:   [5.4478 ns 5.4506 ns 5.4540 ns]
                         thrpt:  [183.35 Melem/s 183.47 Melem/s 183.56 Melem/s]
+```
+
+### dynamic sizing
+### brayniac#correctness-investigation#bfa0607692cd0feb526d598929b2ae025ff21597
+```
+histograms/exponential  time:   [23.607 ns 23.625 ns 23.649 ns]
+                        thrpt:  [42.286 Melem/s 42.328 Melem/s 42.361 Melem/s]
+
+histograms/shared-exponential
+                        time:   [13.096 ns 13.108 ns 13.124 ns]
+                        thrpt:  [76.199 Melem/s 76.289 Melem/s 76.360 Melem/s]
 ```
 
 
