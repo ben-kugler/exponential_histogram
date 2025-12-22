@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicI32, AtomicU64, Ordering},
+};
 
 use atomic_float::AtomicF64;
 
@@ -192,6 +195,13 @@ impl ExponentialHistogram {
 
     pub fn has_negatives(&self) -> bool {
         !self.negative_buckets.is_empty()
+    }
+
+    pub fn take_counts(&self) -> (VecDeque<usize>, VecDeque<usize>) {
+        (
+            self.positive_buckets.as_vec_deque(),
+            self.negative_buckets.as_vec_deque(),
+        )
     }
 }
 

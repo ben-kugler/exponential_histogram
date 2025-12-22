@@ -1,7 +1,12 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+    },
 };
+
+use itertools::Itertools;
 
 /// Pre-allocated capacity to avoid allocations in hot path
 const INITIAL_CAPACITY: usize = 256;
@@ -218,5 +223,15 @@ impl InnerHistogram {
             sum += self.bucket_counts[i].load(Ordering::Acquire);
         }
         sum
+    }
+
+    pub fn as_vec_deque(&self) -> VecDeque<usize> {
+        self.bucket_counts
+            .clone()
+            .as_ref()
+            .iter()
+            .map(|cnts| cnts.load(Ordering::Acquire) as usize)
+            .collect_vec()
+            .into()
     }
 }
