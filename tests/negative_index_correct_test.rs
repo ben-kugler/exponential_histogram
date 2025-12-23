@@ -6,7 +6,8 @@
 use exponential_histogram::ExponentialHistogram;
 
 /// Helper function to calculate the expected OTel bucket index
-fn calculate_otel_index(value: f64, scale: i32) -> i32 {
+fn calculate_otel_index(value: f64, scale: u8) -> i32 {
+    let scale = scale as i32;
     let base = 2.0_f64.powf(2.0_f64.powi(-scale));
     ((value.ln() / base.ln()).ceil() as i32) - 1
 }

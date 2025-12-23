@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicI32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 use atomic_float::AtomicF64;
@@ -8,7 +8,7 @@ use atomic_float::AtomicF64;
 use crate::inner_histogram::InnerHistogram;
 
 // Maximum scale supported (per OTel spec)
-const MAX_SCALE: i32 = 20;
+const MAX_SCALE: u8 = 20;
 
 /// An exponential histogram that stores f64 values in OpenTelemetry proto like buckets
 /// https://github.com/open-telemetry/opentelemetry-proto/blob/cfbf9357c03bf4ac150a3ab3bcbe4cc4ed087362/opentelemetry/proto/metrics/v1/metrics.proto#L466
@@ -21,12 +21,24 @@ pub struct ExponentialHistogram {
     pub(crate) zero_count: AtomicU64,
     pub(crate) zero_threshold: AtomicF64,
     // scale describes the resolution of the histogram
-    pub(crate) scale: AtomicI32,
+    pub(crate) scale: AtomicU8,
     // running sum of values seen so far
     pub(crate) sum: AtomicF64,
     // min and max values seen so far
     pub(crate) min_value: AtomicF64,
     pub(crate) max_value: AtomicF64,
+}
+
+impl PartialEq for ExponentialHistogram {
+    fn eq(&self, other: &Self) -> bool {
+        self.scale.load(Ordering::Relaxed) == other.scale.load(Ordering::Relaxed)
+            && self.zero_threshold.load(Ordering::Relaxed)
+                == other.zero_threshold.load(Ordering::Relaxed)
+            && self.zero_count.load(Ordering::Relaxed) == other.zero_count.load(Ordering::Relaxed)
+            && self.sum.load(Ordering::Relaxed) == other.sum.load(Ordering::Relaxed)
+            && self.min_value.load(Ordering::Relaxed) == other.min_value.load(Ordering::Relaxed)
+            && self.max_value.load(Ordering::Relaxed) == other.max_value.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for ExponentialHistogram {
@@ -80,11 +92,11 @@ impl Default for ExponentialHistogram {
 }
 
 impl ExponentialHistogram {
-    pub fn new(desired_scale: i32) -> Self {
+    pub fn new(desired_scale: u8) -> Self {
         Self::new_with_max_buckets(desired_scale, 160)
     }
 
-    pub fn new_with_max_buckets(desired_scale: i32, _ignored: u16) -> Self {
+    pub fn new_with_max_buckets(desired_scale: u8, _ignored: u16) -> Self {
         let scale = desired_scale.clamp(0, MAX_SCALE);
         Self {
             positive_buckets: InnerHistogram::new(),
@@ -173,7 +185,7 @@ impl ExponentialHistogram {
         if max == f64::MIN { 0.0 } else { max }
     }
 
-    pub fn scale(&self) -> i32 {
+    pub fn scale(&self) -> u8 {
         self.scale.load(Ordering::Acquire)
     }
 
@@ -199,12 +211,53 @@ impl ExponentialHistogram {
             self.negative_buckets.as_vec_deque(),
         )
     }
+
+    /// Returns an iterator over (lower_boundary, count) pairs for all buckets
+    /// The lower_boundary represents the minimum value that would map to that bucket,
+    /// and count is the number of observations in that bucket.
+    pub fn value_counts(&self) -> impl Iterator<Item = (f64, usize)> + '_ {
+        let scale = self.scale.load(Ordering::Relaxed) as i32;
+
+        let neg_offset = self.negative_bucket_start_offset();
+        let negative_iter = self
+            .negative_buckets
+            .as_vec_deque()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, count)| *count > 0)
+            .map(move |(index, count)| (lower_boundary(scale, neg_offset, index), count));
+
+        let pos_offset = self.bucket_start_offset();
+        let positive_iter = self
+            .positive_buckets
+            .as_vec_deque()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, count)| *count > 0)
+            .map(move |(index, count)| (lower_boundary(scale, pos_offset, index), count));
+
+        negative_iter.chain(positive_iter)
+    }
+}
+
+/// Calculate the lower boundary value for a bucket
+///
+/// Given a scale, offset, and bucket index, this calculates the minimum value
+/// that would be placed in that bucket according to the OTel exponential histogram spec.
+///
+/// Formula: 2^((offset + index) * 2^(-scale))
+/// Which is equivalent to: e^((offset + index) * ln(2) * 2^(-scale))
+fn lower_boundary(scale: i32, offset: i32, index: usize) -> f64 {
+    use std::f64::consts::LN_2;
+    let inverse_scale_factor = LN_2 * 2_f64.powi(-scale);
+    ((offset + index as i32) as f64 * inverse_scale_factor).exp()
 }
 
 /// Convert a value to an OpenTelemetry exponential histogram bucket index.
 /// https://opentelemetry.io/docs/specs/otel/metrics/data-model/#producer-expectations
 #[inline(always)]
-fn value_to_otel_index(scale: i32, value: f64) -> Option<i32> {
+fn value_to_otel_index(scale: u8, value: f64) -> Option<i32> {
+    let scale = scale as i32;
     if value <= 0.0 || !value.is_finite() {
         return None;
     }

@@ -9,7 +9,6 @@
 ///
 /// This test verifies that the InnerHistogram correctly handles the offset-based storage
 /// for negative indices.
-
 use exponential_histogram::ExponentialHistogram;
 
 #[test]
@@ -17,15 +16,17 @@ fn test_values_less_than_one_produce_negative_indices() {
     // OTel formula: index = ceil(log(value) / log(base)) - 1
     // where base = 2^(2^(-scale))
 
-    let scale = 4_i32;
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    let scale = 4_u8;
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
 
     println!("\n=== Testing Negative Index Handling ===");
     println!("Scale: {}", scale);
     println!("Base: {:.6}", base);
 
     // Calculate indices for various values
-    let test_values = vec![0.1_f64, 0.25_f64, 0.5_f64, 0.75_f64, 1.0_f64, 2.0_f64, 4.0_f64];
+    let test_values = vec![
+        0.1_f64, 0.25_f64, 0.5_f64, 0.75_f64, 1.0_f64, 2.0_f64, 4.0_f64,
+    ];
 
     println!("\nExpected OTel indices:");
     for &v in &test_values {
@@ -72,8 +73,10 @@ fn test_values_less_than_one_produce_negative_indices() {
 
         // The offset should equal the most negative index
         // But since offset is returned as usize, check if it handles negative correctly
-        println!("\n  Issue: offset is usize ({}), but OTel index is i32 ({})",
-                 offset, index_for_0_1);
+        println!(
+            "\n  Issue: offset is usize ({}), but OTel index is i32 ({})",
+            offset, index_for_0_1
+        );
         println!("  This is a problem! We can't represent negative indices with usize.");
     } else {
         println!("  Index is NOT negative (test values may need adjustment)");
@@ -87,8 +90,8 @@ fn test_negative_index_storage_with_inner_histogram() {
 
     println!("\n=== Direct InnerHistogram Negative Index Test ===");
 
-    let scale = 8_i32; // Higher scale for finer buckets
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    let scale = 8_u8; // Higher scale for finer buckets
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
 
     // These values should produce negative indices
     let small_values = vec![0.001_f64, 0.01_f64, 0.1_f64, 0.5_f64];
@@ -121,7 +124,8 @@ fn test_negative_index_storage_with_inner_histogram() {
     println!("  Bucket count: {}", positive_counts.len());
 
     // Check if we can distinguish between the small values
-    let non_zero_buckets: Vec<_> = positive_counts.iter()
+    let non_zero_buckets: Vec<_> = positive_counts
+        .iter()
         .enumerate()
         .filter(|&(_, count)| *count > 0)
         .collect();
@@ -129,7 +133,10 @@ fn test_negative_index_storage_with_inner_histogram() {
     println!("\nNon-zero buckets: {}", non_zero_buckets.len());
     for &(i, count) in &non_zero_buckets {
         let otel_index = offset as i32 + i as i32;
-        println!("  Bucket {} (OTel index {}): count = {}", i, otel_index, count);
+        println!(
+            "  Bucket {} (OTel index {}): count = {}",
+            i, otel_index, count
+        );
     }
 
     assert_eq!(hist.count(), small_values.len() + 2);
@@ -142,13 +149,13 @@ fn test_bucket_start_offset_type_issue() {
 
     println!("\n=== Bucket Offset Type Issue ===");
 
-    let scale = 10_i32;
+    let scale = 10_u8;
     let hist = ExponentialHistogram::new(scale);
 
     // Add a very small value that should create a large negative index
     hist.accumulate(0.0001);
 
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
     let expected_index = ((0.0001_f64.ln() / base.ln()).ceil() as i32) - 1;
 
     println!("Value: 0.0001");
@@ -160,7 +167,10 @@ fn test_bucket_start_offset_type_issue() {
 
     if expected_index < 0 {
         println!("\n⚠️  PROBLEM DETECTED:");
-        println!("  OTel index is negative ({}) but offset is usize", expected_index);
+        println!(
+            "  OTel index is negative ({}) but offset is usize",
+            expected_index
+        );
         println!("  The usize type cannot represent negative numbers!");
         println!("  This means:");
         println!("    - Either the offset is wrong (cast from negative i32 wraps)");
@@ -174,7 +184,11 @@ fn test_bucket_start_offset_type_issue() {
 
     if !positive_counts.is_empty() {
         println!("First bucket count: {}", positive_counts[0]);
-        assert_eq!(positive_counts.iter().sum::<usize>(), 1, "Should have exactly 1 value");
+        assert_eq!(
+            positive_counts.iter().sum::<usize>(),
+            1,
+            "Should have exactly 1 value"
+        );
     }
 }
 
@@ -186,10 +200,10 @@ fn test_negative_index_with_offset_mapping() {
 
     println!("\n=== Offset Mapping for Negative Indices ===");
 
-    let scale = 4_i32;
+    let scale = 4_u8;
     let hist = ExponentialHistogram::new(scale);
 
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
 
     // Add values in order from smallest to largest
     let values = vec![0.5_f64, 1.0_f64, 2.0_f64, 4.0_f64];
@@ -214,13 +228,18 @@ fn test_negative_index_with_offset_mapping() {
 
     if min_expected_index < 0 {
         println!("\n  ⚠️  Min index is negative!");
-        println!("  Question: How is negative {} represented as usize {}?",
-                 min_expected_index, offset);
+        println!(
+            "  Question: How is negative {} represented as usize {}?",
+            min_expected_index, offset
+        );
 
         // If this wraps around, offset would be a huge number
         if offset > 1_000_000 {
             println!("  → Offset is HUGE - likely wrapping from negative i32!");
-            assert!(false, "Negative i32 wrapped to huge usize - type mismatch bug!");
+            assert!(
+                false,
+                "Negative i32 wrapped to huge usize - type mismatch bug!"
+            );
         }
     }
 
@@ -239,7 +258,7 @@ fn test_negative_bucket_start_offset_method() {
 
     println!("\n=== Negative Bucket Offset Test ===");
 
-    let scale = 4_i32;
+    let scale = 4_u8;
     let hist = ExponentialHistogram::new(scale);
 
     // Add negative values (which use negative_buckets histogram)
@@ -255,7 +274,7 @@ fn test_negative_bucket_start_offset_method() {
 
     // For negative values, we use their absolute value for indexing
     // So -0.5 uses abs(-0.5) = 0.5 for the index calculation
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
     let index_for_0_5 = ((0.5_f64.ln() / base.ln()).ceil() as i32) - 1;
 
     println!("Expected index for abs(-0.5): {}", index_for_0_5);

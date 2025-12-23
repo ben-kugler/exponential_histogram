@@ -6,8 +6,8 @@
 use exponential_histogram::ExponentialHistogram;
 
 /// Helper function to calculate the expected OTel bucket index
-fn calculate_otel_index(value: f64, scale: i32) -> i32 {
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+fn calculate_otel_index(value: f64, scale: u8) -> i32 {
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
     ((value.ln() / base.ln()).ceil() as i32) - 1
 }
 
@@ -36,7 +36,7 @@ fn test_span_exactly_256_buckets() {
     println!("Max storable index: {}", max_storable_index);
 
     // Find a value that produces this index
-    let base = 2.0_f64.powf(2.0_f64.powi(-scale));
+    let base = 2.0_f64.powf(2.0_f64.powi(-(scale as i32)));
     let max_value = base.powf((max_storable_index + 1) as f64);
 
     println!("Max storable value (approx): {:.2}", max_value);
@@ -48,12 +48,14 @@ fn test_span_exactly_256_buckets() {
     println!("Actual index for {:.2}: {}", max_value * 0.9, actual_index);
 
     // Should be within bounds
-    assert!(actual_index - offset < 256,
-        "Should fit within 256 buckets");
+    assert!(actual_index - offset < 256, "Should fit within 256 buckets");
 
     assert_eq!(hist.count(), 2, "Both values should be stored");
 
-    println!("✅ Span of {} buckets fits within capacity", actual_index - offset + 1);
+    println!(
+        "✅ Span of {} buckets fits within capacity",
+        actual_index - offset + 1
+    );
 }
 
 #[test]
@@ -82,7 +84,12 @@ fn test_span_exceeds_256_by_adding_large_value() {
 
     println!("\nHuge value: {}", huge_value);
     println!("Huge index: {}", huge_index);
-    println!("Span: {} - {} = {}", huge_index, offset, huge_index - offset);
+    println!(
+        "Span: {} - {} = {}",
+        huge_index,
+        offset,
+        huge_index - offset
+    );
 
     hist.accumulate(huge_value);
 
@@ -105,9 +112,7 @@ fn test_span_exceeds_256_by_adding_large_value() {
 
     // But where did it go in the buckets?
     let (counts, _) = hist.take_counts();
-    let non_zero: Vec<_> = counts.iter().enumerate()
-        .filter(|&(_, &c)| c > 0)
-        .collect();
+    let non_zero: Vec<_> = counts.iter().enumerate().filter(|&(_, &c)| c > 0).collect();
 
     println!("\nNon-zero buckets: {}", non_zero.len());
     for &(i, &count) in &non_zero {
@@ -148,7 +153,12 @@ fn test_span_exceeds_256_by_adding_small_value() {
 
     println!("\nTiny value: {}", tiny_value);
     println!("Tiny index: {}", tiny_index);
-    println!("Span: {} - {} = {}", large_index, tiny_index, large_index - tiny_index);
+    println!(
+        "Span: {} - {} = {}",
+        large_index,
+        tiny_index,
+        large_index - tiny_index
+    );
 
     hist.accumulate(tiny_value);
 
@@ -178,9 +188,7 @@ fn test_span_exceeds_256_by_adding_small_value() {
 
     // Check bucket distribution
     let (counts, _) = hist.take_counts();
-    let non_zero: Vec<_> = counts.iter().enumerate()
-        .filter(|&(_, &c)| c > 0)
-        .collect();
+    let non_zero: Vec<_> = counts.iter().enumerate().filter(|&(_, &c)| c > 0).collect();
 
     println!("\nNon-zero buckets: {}", non_zero.len());
     for &(i, &count) in &non_zero {
@@ -246,7 +254,11 @@ fn test_many_values_exceeding_span() {
     if total_in_buckets == values.len() {
         println!("  ✅ All values stored in buckets");
     } else if total_in_buckets < values.len() {
-        println!("  ⚠️  Some values lost: {} < {}", total_in_buckets, values.len());
+        println!(
+            "  ⚠️  Some values lost: {} < {}",
+            total_in_buckets,
+            values.len()
+        );
     } else {
         println!("  ⚠️  Unexpected: more counts than values!");
     }
@@ -326,9 +338,7 @@ fn test_offset_shift_behavior() {
     println!("  Offset: {}", offset4);
 
     let (counts, _) = hist.take_counts();
-    let non_zero: Vec<_> = counts.iter().enumerate()
-        .filter(|&(_, &c)| c > 0)
-        .collect();
+    let non_zero: Vec<_> = counts.iter().enumerate().filter(|&(_, &c)| c > 0).collect();
 
     println!("  Non-zero buckets: {}", non_zero.len());
 
@@ -370,15 +380,19 @@ fn test_precision_loss_with_overflow() {
     println!("  Actual sum: {:.3}", actual_sum);
 
     // Count should always be exact (tracked separately)
-    assert_eq!(actual_count, expected_count,
-        "Count should be exact even with bucket overflow");
+    assert_eq!(
+        actual_count, expected_count,
+        "Count should be exact even with bucket overflow"
+    );
 
     // Sum should also be exact (tracked separately as AtomicF64)
     let sum_error = (actual_sum - expected_sum).abs() / expected_sum;
     println!("  Sum relative error: {:.4}%", sum_error * 100.0);
 
-    assert!(sum_error < 0.0001,
-        "Sum should be exact (tracked separately, not from buckets)");
+    assert!(
+        sum_error < 0.0001,
+        "Sum should be exact (tracked separately, not from buckets)"
+    );
 
     // Min/max should be exact
     assert_eq!(hist.min(), 0.001);
@@ -420,15 +434,16 @@ fn test_bucket_counts_with_overflow() {
     println!("  Offset: {}", offset);
     println!("  Array length: {}", counts.len());
 
-    let non_zero: Vec<_> = counts.iter().enumerate()
-        .filter(|&(_, &c)| c > 0)
-        .collect();
+    let non_zero: Vec<_> = counts.iter().enumerate().filter(|&(_, &c)| c > 0).collect();
 
     println!("  Non-zero buckets: {}", non_zero.len());
 
     for &(i, &count) in &non_zero {
         let otel_idx = offset + i as i32;
-        println!("    Bucket[{}]: OTel index {}, count {}", i, otel_idx, count);
+        println!(
+            "    Bucket[{}]: OTel index {}, count {}",
+            i, otel_idx, count
+        );
     }
 
     // If span > 256, one value must be capped

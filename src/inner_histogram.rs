@@ -26,6 +26,20 @@ pub(crate) struct InnerHistogram {
     pub(crate) max_boundary: AtomicI32,
 }
 
+impl PartialEq for InnerHistogram {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket_counts
+            .iter()
+            .zip(other.bucket_counts.iter())
+            .all(|(a, b)| a.load(Ordering::Relaxed) == b.load(Ordering::Relaxed))
+            && self.offset.load(Ordering::Relaxed) == other.offset.load(Ordering::Relaxed)
+            && self.min_boundary.load(Ordering::Relaxed)
+                == other.min_boundary.load(Ordering::Relaxed)
+            && self.max_boundary.load(Ordering::Relaxed)
+                == other.max_boundary.load(Ordering::Relaxed)
+    }
+}
+
 impl Clone for InnerHistogram {
     fn clone(&self) -> Self {
         Self {

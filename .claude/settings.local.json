@@ -13,7 +13,8 @@
       "Bash(rm:*)",
       "Bash(mkdir:*)",
       "Bash(cargo run:*)",
-      "Bash(cargo bench:*)"
+      "Bash(cargo bench:*)",
+      "Read(//Users/benkugler/Documents/GitHub/tmp/exponential_histogram/src/**)"
     ],
     "deny": [],
     "ask": []
