@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
     },
 };
 
@@ -11,17 +11,19 @@ use itertools::Itertools;
 /// Pre-allocated capacity to avoid allocations in hot path
 const INITIAL_CAPACITY: usize = 256;
 
+// If we ever hit this MIN, then something else has gone horribly wrong.
+const NOT_INITIALIZED: i32 = i32::MIN;
+
 // In place of histogram::Histogram
 #[derive(Debug, Default)]
 pub(crate) struct InnerHistogram {
     bucket_counts: Arc<Box<[AtomicU64]>>,
     // The index of the first entry of OTel data in bucket_counts
+    // If offset == NOT_INITIALIZED, then the histogram is not initialized
     offset: AtomicI32,
-    // Our data lies between min_boundry and max_boundry
+    // Our data lies between min_boundary and max_boundary
     pub(crate) min_boundary: AtomicI32,
     pub(crate) max_boundary: AtomicI32,
-    // Have we seen any data?
-    initialized: AtomicBool,
 }
 
 impl Clone for InnerHistogram {
@@ -31,7 +33,6 @@ impl Clone for InnerHistogram {
             offset: self.offset.load(Ordering::Acquire).into(),
             min_boundary: self.min_boundary.load(Ordering::Acquire).into(),
             max_boundary: self.max_boundary.load(Ordering::Acquire).into(),
-            initialized: self.initialized.load(Ordering::Acquire).into(),
         }
     }
 }
@@ -43,30 +44,24 @@ impl InnerHistogram {
 
         Self {
             bucket_counts: Arc::new(buckets.into()),
-            offset: 0.into(),
+            offset: NOT_INITIALIZED.into(),
             min_boundary: 0.into(),
             max_boundary: 0.into(),
-            initialized: false.into(),
         }
     }
 
     #[inline(always)]
     pub(crate) fn increment(&self, otel_index: i32) {
-        if !self.initialized.load(Ordering::Acquire) {
-            if self
-                .initialized
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.offset.store(otel_index, Ordering::Release);
-                self.min_boundary.store(otel_index, Ordering::Release);
-                self.max_boundary.store(otel_index, Ordering::Release);
-                self.bucket_counts[0].store(1, Ordering::Release);
-                return;
-            }
-        }
+        let offset = if let Some(offset) = self.offset() {
+            offset
+        } else {
+            self.offset.store(otel_index, Ordering::Release);
+            self.min_boundary.store(otel_index, Ordering::Release);
+            self.max_boundary.store(otel_index, Ordering::Release);
+            self.bucket_counts[0].store(1, Ordering::Release);
+            return;
+        };
 
-        let offset = self.offset.load(Ordering::Acquire);
         let index = otel_index - offset;
 
         if index < 0 {
@@ -200,26 +195,29 @@ impl InnerHistogram {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        !self.initialized.load(Ordering::Acquire)
+        self.offset().is_none()
     }
 
-    pub fn offset(&self) -> i32 {
-        self.offset.load(Ordering::Relaxed)
+    pub fn offset(&self) -> Option<i32> {
+        match self.offset.load(Ordering::Relaxed) {
+            NOT_INITIALIZED => None,
+            offset => Some(offset),
+        }
     }
 
     pub fn total_count(&self) -> u64 {
-        if !self.initialized.load(Ordering::Acquire) {
+        if let Some(offset) = self.offset() {
+            let max_boundary = self.max_boundary.load(Ordering::Acquire);
+            let end = ((max_boundary - offset + 1) as usize).min(INITIAL_CAPACITY);
+
+            let mut sum = 0u64;
+            for i in 0..end {
+                sum += self.bucket_counts[i].load(Ordering::Acquire);
+            }
+            sum
+        } else {
             return 0;
         }
-        let offset = self.offset.load(Ordering::Acquire);
-        let max_boundary = self.max_boundary.load(Ordering::Acquire);
-        let end = ((max_boundary - offset + 1) as usize).min(INITIAL_CAPACITY);
-
-        let mut sum = 0u64;
-        for i in 0..end {
-            sum += self.bucket_counts[i].load(Ordering::Acquire);
-        }
-        sum
     }
 
     pub fn as_vec_deque(&self) -> VecDeque<usize> {

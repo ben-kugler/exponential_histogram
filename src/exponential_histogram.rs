@@ -182,11 +182,11 @@ impl ExponentialHistogram {
     }
 
     pub fn bucket_start_offset(&self) -> i32 {
-        self.positive_buckets.offset()
+        self.positive_buckets.offset().unwrap_or(0)
     }
 
     pub fn negative_bucket_start_offset(&self) -> i32 {
-        self.negative_buckets.offset()
+        self.negative_buckets.offset().unwrap_or(0)
     }
 
     pub fn has_negatives(&self) -> bool {
@@ -235,9 +235,7 @@ fn value_to_otel_index(scale: i32, value: f64) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{exponential_histogram::value_to_otel_index, shared::*};
-
-    use std::time::{Duration, Instant};
+    use crate::exponential_histogram::value_to_otel_index;
 
     use super::ExponentialHistogram;
 
